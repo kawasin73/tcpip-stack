@@ -128,3 +128,35 @@ int soc_dev_addr(char *name, uint8_t *dst, size_t size) {
   close(fd);
   return 0;
 }
+
+#include "raw.h"
+
+static int soc_dev_open_wrap(struct rawdev *dev) {
+  dev->priv = soc_dev_open(dev->name);
+  return dev->priv ? 0 : -1;
+}
+
+static void soc_dev_close_wrap(struct rawdev *dev) { soc_dev_close(dev->priv); }
+
+static void soc_dev_rx_wrap(struct rawdev *dev,
+                            void (*callback)(uint8_t *, size_t, void *),
+                            void *arg, int timeout) {
+  soc_dev_rx(dev->priv, callback, arg, timeout);
+}
+
+static ssize_t soc_dev_tx_wrap(struct rawdev *dev, const uint8_t *buf,
+                               size_t len) {
+  return soc_dev_tx(dev->priv, buf, len);
+}
+
+static int soc_dev_addr_wrap(struct rawdev *dev, uint8_t *dst, size_t size) {
+  return soc_dev_addr(dev->name, dst, size);
+}
+
+struct rawdev_ops soc_dev_ops = {
+    .open = soc_dev_open_wrap,
+    .close = soc_dev_close_wrap,
+    .rx = soc_dev_rx_wrap,
+    .tx = soc_dev_tx_wrap,
+    .addr = soc_dev_addr_wrap,
+};

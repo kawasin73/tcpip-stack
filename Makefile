@@ -1,8 +1,19 @@
-TEST = test/raw_soc_test
-OBJS = raw/soc.o
+TEST = test/raw_test
+OBJS = raw.o
+CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I .
 
-test/raw_soc_test: test/raw_soc_test.c $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) test/raw_soc_test.c
+ifeq ($(shell uname), Linux)
+	OBJS := $(OBJS) raw/soc.o
+	TEST := $(TEST) test/raw_soc_test
+	CFLAGS := $(CFLAGS) -DHAVE_PF_PACKET
+endif
+
+.PHONY: all clean
+
+all: $(TEST)
+
+$(TEST): % : %.o $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
 
 .c.o:
 	$(CC) $(CFLAGS) -c $< -o $@

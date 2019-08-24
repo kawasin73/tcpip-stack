@@ -1,6 +1,6 @@
 #include <signal.h>
 #include <stdio.h>
-#include "../raw/soc.h"
+#include "raw/soc.h"
 
 volatile sig_atomic_t terminate;
 
