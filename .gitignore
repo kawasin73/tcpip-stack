@@ -1,3 +1,6 @@
 .DS_Store
 .vagrant/
 .ssh-config
+*.o
+
+test/raw_soc_test
