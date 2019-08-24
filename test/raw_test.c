@@ -1,6 +1,7 @@
 #include "raw.h"
 #include <signal.h>
 #include <stdio.h>
+#include "util.h"
 
 volatile sig_atomic_t terminate;
 
@@ -8,6 +9,7 @@ static void on_signal(int s) { terminate = 1; }
 
 static void dump(uint8_t *frame, size_t len, void *arg) {
   fprintf(stderr, "%s: receive %zu octets\n", (char *)arg, len);
+  hexdump(stderr, frame, len);
 }
 
 int main(int argc, char const *argv[]) {
@@ -17,7 +19,7 @@ int main(int argc, char const *argv[]) {
 
   signal(SIGINT, on_signal);
 
-  dev = rawdev_alloc(RAWDEV_TYPE_AUTO ,name);
+  dev = rawdev_alloc(RAWDEV_TYPE_AUTO, name);
   if (dev == NULL) {
     fprintf(stderr, "rawdev_alloc(): error\n");
     return -1;

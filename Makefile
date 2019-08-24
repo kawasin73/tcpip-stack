@@ -1,5 +1,5 @@
 TEST = test/raw_test
-OBJS = raw.o
+OBJS = raw.o util.o
 CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I .
 
 ifeq ($(shell uname), Linux)
