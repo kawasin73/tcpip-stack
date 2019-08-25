@@ -1,11 +1,11 @@
-TEST = test/raw_test
-OBJS = raw.o util.o
-CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I .
+TEST = test/raw_test test/ethernet_test
+OBJS = raw.o util.o ethernet.o net.o
+CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I . -DDEBUG
 
 ifeq ($(shell uname), Linux)
 	OBJS := $(OBJS) raw/soc.o
 	TEST := $(TEST) test/raw_soc_test
-	CFLAGS := $(CFLAGS) -DHAVE_PF_PACKET
+	CFLAGS := $(CFLAGS) -pthread -DHAVE_PF_PACKET
 endif
 
 .PHONY: all clean
