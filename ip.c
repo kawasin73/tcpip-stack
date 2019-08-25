@@ -1,4 +1,5 @@
 #include "ip.h"
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -7,6 +8,9 @@
 #include <time.h>
 #include "net.h"
 #include "util.h"
+
+#define IP_FRAGMENT_TIMEOUT_SEC 30
+#define IP_FRAGMENT_NUM_MAX 8
 
 struct ip_fragment {
   struct ip_fragment *next;
@@ -28,6 +32,7 @@ struct ip_protocol {
 };
 
 static struct ip_protocol *protocols = NULL;
+static struct ip_fragment *fragments = NULL;
 static int ip_forwarding = 0;
 
 const ip_addr_t IP_ADDR_ANY = 0x00000000;
@@ -80,6 +85,146 @@ void ip_dump(struct netif *netif, struct ip_hdr *hdr, uint8_t *packet,
   fprintf(stderr, " protocol: 0x%02x\n", hdr->protocol);
   fprintf(stderr, "      len: %zu octets\n", plen);
   hexdump(stderr, packet, plen);
+}
+
+/*
+ * IP FRAGMENT
+ */
+
+static struct ip_fragment *ip_fragment_alloc(struct ip_hdr *hdr) {
+  struct ip_fragment *new_fragment;
+
+  new_fragment = malloc(sizeof(struct ip_fragment));
+  if (!new_fragment) {
+    return NULL;
+  }
+  new_fragment->next = fragments;
+  new_fragment->src = hdr->src;
+  new_fragment->dst = hdr->dst;
+  new_fragment->id = hdr->id;
+  new_fragment->protocol = hdr->protocol;
+  new_fragment->len = 0;
+  memset(new_fragment->data, 0, sizeof(new_fragment->data));
+  maskclr(new_fragment->mask, sizeof(new_fragment->mask));
+  fragments = new_fragment;
+  return new_fragment;
+}
+
+static void ip_fragment_free(struct ip_fragment *fragment) { free(fragment); }
+
+static struct ip_fragment *ip_fragment_detach(struct ip_fragment *fragment) {
+  struct ip_fragment *entry, *prev = NULL;
+
+  for (entry = fragments; entry; entry = entry->next) {
+    if (entry == fragment) {
+      if (prev) {
+        prev->next = fragment->next;
+      } else {
+        fragments = fragment->next;
+      }
+      fragment->next = NULL;
+      return fragment;
+    }
+    prev = entry;
+  }
+  return NULL;
+}
+
+static struct ip_fragment *ip_fragment_search(struct ip_hdr *hdr) {
+  struct ip_fragment *entry;
+
+  for (entry = fragments; entry; entry = entry->next) {
+    if (entry->src == hdr->src && entry->dst == hdr->dst &&
+        entry->id == hdr->id && entry->protocol == hdr->protocol) {
+      return entry;
+    }
+  }
+  return NULL;
+}
+
+static int ip_fragment_patrol(void) {
+  time_t now;
+  struct ip_fragment *entry, *prev = NULL;
+  int count = 0;
+
+  now = time(NULL);
+  entry = fragments;
+  while (entry) {
+    if (now - entry->timestamp > IP_FRAGMENT_TIMEOUT_SEC) {
+      if (prev) {
+        entry = prev->next = entry->next;
+      } else {
+        entry = fragments = entry->next;
+      }
+      free(entry);
+      count++;
+      continue;
+    }
+    prev = entry;
+    entry = entry->next;
+  }
+  return count;
+}
+
+static struct ip_fragment *ip_fragment_process(struct ip_hdr *hdr,
+                                               uint8_t *payload, size_t plen) {
+  struct ip_fragment *fragment;
+  uint16_t off;
+  static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+  static time_t timestamp = 0;
+  static size_t count = 0;
+
+  pthread_mutex_lock(&mutex);
+
+  // check fragment timeout
+  if (time(NULL) - timestamp > 10) {
+    ip_fragment_patrol();
+  }
+
+  // find or create fragment object
+  fragment = ip_fragment_search(hdr);
+  if (!fragment) {
+    if (count >= IP_FRAGMENT_NUM_MAX) {
+      // too many fragments
+      pthread_mutex_unlock(&mutex);
+      return NULL;
+    }
+    // create new fragment object
+    fragment = ip_fragment_alloc(hdr);
+    if (!fragment) {
+      // failed to allocate fragment object
+      pthread_mutex_unlock(&mutex);
+      return NULL;
+    }
+    count++;
+  }
+
+  // copy data to fragment object
+  off = (ntoh16(hdr->offset) & 0x1fff) << 3;
+  memcpy(fragment->data + off, payload, plen);
+  maskset(fragment->mask, sizeof(fragment->mask), off, plen);
+  if ((ntoh16(hdr->offset) & 0x2000) == 0) {
+    fragment->len = off + plen;
+  }
+  fragment->timestamp = time(NULL);
+
+  // check fragment is completed
+  if (!fragment->len) {
+    // don't know total fragment length yet
+    pthread_mutex_unlock(&mutex);
+    return NULL;
+  }
+  if (!maskchk(fragment->mask, sizeof(fragment->mask), 0, fragment->len)) {
+    // imcomplete fragments
+    pthread_mutex_unlock(&mutex);
+    return NULL;
+  }
+
+  // detach fragment object
+  ip_fragment_detach(fragment);
+  count--;
+  pthread_mutex_unlock(&mutex);
+  return fragment;
 }
 
 /*
@@ -145,9 +290,13 @@ static void ip_rx(uint8_t *dgram, size_t dlen, struct netdev *dev) {
   plen = ntoh16(hdr->len) - hlen;
   offset = ntoh16(hdr->offset);
   if (offset & 0x2000 || offset & 0x1fff) {
-    // TODO: fragment
-    fprintf(stderr, "TODO: fragmented.\n");
-    return;
+    fragment = ip_fragment_process(hdr, payload, plen);
+    if (!fragment) {
+      return;
+    }
+    // completed fragment
+    payload = fragment->data;
+    plen = fragment->len;
   }
   for (protocol = protocols; protocol; protocol = protocol->next) {
     if (protocol->type == hdr->protocol) {
@@ -157,7 +306,7 @@ static void ip_rx(uint8_t *dgram, size_t dlen, struct netdev *dev) {
     }
   }
   if (fragment) {
-    // TODO: free fragment
+    ip_fragment_free(fragment);
   }
 }
 
