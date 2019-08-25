@@ -1,7 +1,9 @@
 #include "net.h"
+#include <stdint.h>
 #include <stdlib.h>
+#include "util.h"
 
-static struct netdev_driver {
+struct netdev_driver {
   struct netdev_driver *next;
   uint16_t type;
   uint16_t mtu;
@@ -11,7 +13,14 @@ static struct netdev_driver {
   struct netdev_ops *ops;
 };
 
+struct netdev_proto {
+  struct netdev_proto *next;
+  uint16_t type;
+  void (*handler)(uint8_t *packet, size_t plen, struct netdev *dev);
+};
+
 static struct netdev_driver *drivers = NULL;
+static struct netdev_proto *protos = NULL;
 static struct netdev *devices = NULL;
 
 int netdev_driver_register(struct netdev_def *def) {
@@ -37,8 +46,38 @@ int netdev_driver_register(struct netdev_def *def) {
   return 0;
 }
 
-static void netdev_rx_handler(struct netdev* dev, uint16_t type, uint8_t *packet, size_t plen) {
-  // TODO: handle protocol
+int netdev_proto_register(unsigned short type,
+                          void (*handler)(uint8_t *packet, size_t plen,
+                                          struct netdev *dev)) {
+  struct netdev_proto *entry;
+
+  // check this proto is already registered
+  for (entry = protos; entry; entry = entry->next) {
+    if (entry->type == type) {
+      return -1;
+    }
+  }
+
+  entry = malloc(sizeof(struct netdev_proto));
+  if (!entry) {
+    return -1;
+  }
+  entry->next = protos;
+  entry->type = type;
+  entry->handler = handler;
+  protos = entry;
+  return 0;
+}
+
+static void netdev_rx_handler(struct netdev *dev, uint16_t type,
+                              uint8_t *packet, size_t plen) {
+  struct netdev_proto *entry;
+
+  for (entry = protos; entry; entry = entry->next) {
+    if (hton16(entry->type) == type) {
+      entry->handler(packet, plen, dev);
+    }
+  }
 }
 
 struct netdev *netdev_alloc(uint16_t type) {
@@ -70,4 +109,32 @@ struct netdev *netdev_alloc(uint16_t type) {
   dev->ops = driver->ops;
   devices = dev;
   return dev;
+}
+
+int netdev_add_netif(struct netdev *dev, struct netif *netif) {
+  struct netif *entry;
+
+  // check netif is already registered to this netdev
+  for (entry = dev->ifs; entry; entry = entry->next) {
+    if (entry->family == netif->family) {
+      return -1;
+    }
+  }
+
+  // set netif
+  netif->next = dev->ifs;
+  netif->dev = dev;
+  dev->ifs = netif;
+  return 0;
+}
+
+struct netif *netdev_get_netif(struct netdev *dev, int family) {
+  struct netif *entry;
+
+  for (entry = dev->ifs; entry; entry = entry->next) {
+    if (entry->family == family) {
+      return entry;
+    }
+  }
+  return NULL;
 }

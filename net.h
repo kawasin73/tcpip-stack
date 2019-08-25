@@ -8,6 +8,11 @@
 
 #define NETDEV_FLAG_BROADCAST (0x0001)
 
+#include "ethernet.h"
+#define NETDEV_PROTO_IP ETHERNET_TYPE_IP
+
+#define NETIF_FAMILY_IPV4 (0x02)
+
 #ifndef IFNAMSIZ
 #define IFNAMSIZ (16)
 #endif
@@ -26,8 +31,8 @@ struct netdev_ops {
   int (*close)(struct netdev *dev);
   int (*run)(struct netdev *dev);
   int (*stop)(struct netdev *dev);
-  ssize_t (*tx)(struct netdev *dev, uint16_t type, uint8_t *packet,
-                size_t size, const void *dst);
+  ssize_t (*tx)(struct netdev *dev, uint16_t type, uint8_t *packet, size_t size,
+                const void *dst);
 };
 
 struct netdev_def {
@@ -58,7 +63,12 @@ struct netdev {
 };
 
 int netdev_driver_register(struct netdev_def *def);
+int netdev_proto_register(unsigned short type,
+                          void (*handler)(uint8_t *packet, size_t plen,
+                                          struct netdev *dev));
 
 struct netdev *netdev_alloc(uint16_t type);
+int netdev_add_netif(struct netdev *dev, struct netif *netif);
+struct netif *netdev_get_netif(struct netdev *dev, int family);
 
 #endif
