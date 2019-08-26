@@ -70,6 +70,6 @@ Vagrant.configure("2") do |config|
   # SHELL
   config.vm.provision "shell", inline: <<-SHELL
     apt-get update
-    apt-get install -y git build-essential
+    apt-get install -y git build-essential gdb
   SHELL
 end

@@ -12,6 +12,14 @@
 #define IP_FRAGMENT_TIMEOUT_SEC 30
 #define IP_FRAGMENT_NUM_MAX 8
 
+struct ip_route {
+  uint8_t used;
+  ip_addr_t network;
+  ip_addr_t netmask;
+  ip_addr_t nexthop;
+  struct netif *netif;
+};
+
 struct ip_fragment {
   struct ip_fragment *next;
   ip_addr_t src;
@@ -308,6 +316,105 @@ static void ip_rx(uint8_t *dgram, size_t dlen, struct netdev *dev) {
   if (fragment) {
     ip_fragment_free(fragment);
   }
+}
+
+static int ip_tx_netdev(struct netif *netif, uint8_t *packet, size_t plen,
+                        const ip_addr_t *dst) {
+  ssize_t ret;
+  uint8_t ha[128] = {};
+
+  if (!(netif->dev->flags & NETDEV_FLAG_NOARP)) {
+    if (dst) {
+      // TODO: resolve arp
+      // return -1;
+    } else {
+      memcpy(ha, netif->dev->broadcast, netif->dev->alen);
+    }
+  }
+  if (netif->dev->ops->tx(netif->dev, ETHERNET_TYPE_IP, packet, plen,
+                          (void *)ha) != (ssize_t)plen) {
+    return -1;
+  }
+  return 1;
+}
+
+static int ip_tx_core(struct netif *netif, uint8_t protocol, const uint8_t *buf,
+                      size_t len, const ip_addr_t *src, const ip_addr_t *dst,
+                      const ip_addr_t *nexthop, uint16_t id, uint16_t offset) {
+  uint8_t packet[4096];
+  struct ip_hdr *hdr;
+  uint16_t hlen;
+
+  // set header
+  hdr = (struct ip_hdr *)packet;
+  hlen = sizeof(struct ip_hdr);
+  hdr->vhl = (IP_VERSION_IPV4 << 4) | (hlen >> 2);
+  hdr->tos = 0;
+  hdr->len = hton16(hlen + len);
+  hdr->id = hton16(id);
+  hdr->offset = hton16(offset);
+  hdr->ttl = 0xff;
+  hdr->protocol = protocol;
+  hdr->sum = 0;
+  hdr->src = src ? *src : ((struct netif_ip *)netif)->unicast;
+  hdr->dst = *dst;
+  hdr->sum = cksum16((uint16_t *)hdr, hlen, 0);
+
+  // copy payload
+  memcpy(hdr + 1, buf, len);
+
+#ifdef DEBUG
+  fprintf(stderr, ">>> ip_tx_core <<<\n");
+  ip_dump(netif, hdr, (uint8_t *)packet, hlen + len);
+#endif
+
+  return ip_tx_netdev(netif, (uint8_t *)packet, hlen + len, nexthop);
+}
+
+static uint16_t ip_generate_id(void) {
+  static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+  static uint16_t id = 128;
+  uint16_t ret;
+
+  // TODO: multi netdev
+  // TODO: rotate id
+  pthread_mutex_lock(&mutex);
+  ret = id++;
+  pthread_mutex_unlock(&mutex);
+  return ret;
+}
+
+ssize_t ip_tx(struct netif *netif, uint8_t protocol, const uint8_t *buf,
+              size_t len, const ip_addr_t *dst) {
+  struct ip_route *route;
+  ip_addr_t *nexthop = NULL, *src = NULL;
+  uint16_t id, flag, offset;
+  size_t done, slen;
+
+  // determine nexthop
+  if (netif && *dst == IPADDR_BROADCAST) {
+    nexthop = NULL;
+  } else {
+    // TODO: find route
+    if (netif) {
+      src = &((struct netif_ip *)netif)->unicast;
+    }
+    // TODO: use route to determin nexthop
+    nexthop = dst;
+  }
+  id = ip_generate_id();
+
+  // send ip packet (if fragmented then sometimes)
+  for (done = 0; done < len; done += slen) {
+    slen = MIN((len - done), (size_t)(netif->dev->mtu - IP_HDR_SIZE_MIN));
+    flag = ((done + slen) < len) ? 0x2000 : 0x0000;
+    offset = flag | ((done >> 3) & 0x1fff);
+    if (ip_tx_core(netif, protocol, buf + done, slen, src, dst, nexthop, id,
+                   offset) == -1) {
+      return -1;
+    }
+  }
+  return len;
 }
 
 int ip_init(void) { return netdev_proto_register(NETDEV_PROTO_IP, ip_rx); }

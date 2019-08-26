@@ -3,9 +3,15 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <unistd.h>
 #include "net.h"
 
 #define IP_VERSION_IPV4 4
+
+#define IP_HDR_SIZE_MIN 20
+#define IP_HDR_SIZE_MAX 60
+
+#define IP_PAYLOAD_SIZE_MAX (65535 - IP_HDR_SIZE_MIN)
 
 #define IP_ADDR_LEN 4
 #define IP_ADDR_STR_LEN 16 /* "ddd.ddd.ddd.ddd\0" */
@@ -35,9 +41,14 @@ struct netif_ip {
   ip_addr_t gateway;
 };
 
+extern const ip_addr_t IP_ADDR_ANY;
+extern const ip_addr_t IPADDR_BROADCAST;
+
 int ip_addr_pton(const char *p, ip_addr_t *n);
 char *ip_addr_ntop(const ip_addr_t *n, char *p, size_t size);
 
+ssize_t ip_tx(struct netif *netif, uint8_t protocol, const uint8_t *buf,
+              size_t len, const ip_addr_t *dst);
 int ip_init(void);
 
 #endif
