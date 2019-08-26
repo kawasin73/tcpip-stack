@@ -1,5 +1,5 @@
 TEST = test/raw_test test/ethernet_test test/ip_test test/mask_test
-OBJS = raw.o util.o ethernet.o net.o ip.o
+OBJS = raw.o util.o ethernet.o net.o ip.o arp.o
 CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I . -DDEBUG -g
 
 ifeq ($(shell uname), Linux)

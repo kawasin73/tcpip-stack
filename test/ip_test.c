@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include "arp.h"
 #include "ethernet.h"
 #include "net.h"
 #include "raw.h"
@@ -14,6 +15,9 @@ static int setup(void) {
     return -1;
   } else if (ip_init() == -1) {
     fprintf(stderr, "ip_init(): failure\n");
+    return -1;
+  } else if (arp_init() == -1) {
+    fprintf(stderr, "arp_init(): failure\n");
     return -1;
   }
   return 0;

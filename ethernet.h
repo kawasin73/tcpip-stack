@@ -20,6 +20,9 @@
 #define ETHERNET_TYPE_ARP (0x0806)
 #define ETHERNET_TYPE_IPV6 (0x86dd)
 
+extern const uint8_t ETHERNET_ADDR_ANY[ETHERNET_ADDR_LEN];
+extern const uint8_t ETHERNET_ADDR_BROADCAST[ETHERNET_ADDR_LEN];
+
 int ethernet_addr_pton(const char *p, uint8_t *n);
 char *ethernet_addr_ntop(const uint8_t *n, char *p, size_t size);
 int ethernet_init(void);

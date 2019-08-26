@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "arp.h"
 #include "net.h"
 #include "util.h"
 
@@ -325,8 +326,13 @@ static int ip_tx_netdev(struct netif *netif, uint8_t *packet, size_t plen,
 
   if (!(netif->dev->flags & NETDEV_FLAG_NOARP)) {
     if (dst) {
-      // TODO: resolve arp
-      // return -1;
+      ret = arp_resolve(netif, dst, (void *)ha, packet, plen);
+      if (ret != ARP_RESOLVE_FOUND) {
+        // ARP_RESOLVE_ERROR then error
+        // ARP_RESOLVE_QUERY then wait and send packet in arp layer after arp
+        // reply come
+        return ret;
+      }
     } else {
       memcpy(ha, netif->dev->broadcast, netif->dev->alen);
     }
