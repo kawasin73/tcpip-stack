@@ -8,6 +8,11 @@
 
 #define IP_VERSION_IPV4 4
 
+#define IP_PROTOCOL_ICMP 1
+#define IP_PROTOCOL_TCP 6
+#define IP_PROTOCOL_UDP 17
+#define IP_PROTOCOL_RAW 255
+
 #define IP_HDR_SIZE_MIN 20
 #define IP_HDR_SIZE_MAX 60
 
@@ -49,6 +54,9 @@ char *ip_addr_ntop(const ip_addr_t *n, char *p, size_t size);
 
 ssize_t ip_tx(struct netif *netif, uint8_t protocol, const uint8_t *buf,
               size_t len, const ip_addr_t *dst);
+int ip_add_protocol(uint8_t protocol,
+                    void (*handler)(uint8_t *, size_t, ip_addr_t *, ip_addr_t *,
+                                    struct netif *));
 int ip_init(void);
 
 #endif

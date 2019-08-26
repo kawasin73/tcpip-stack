@@ -423,4 +423,25 @@ ssize_t ip_tx(struct netif *netif, uint8_t protocol, const uint8_t *buf,
   return len;
 }
 
+int ip_add_protocol(uint8_t protocol,
+                    void (*handler)(uint8_t *, size_t, ip_addr_t *, ip_addr_t *,
+                                    struct netif *)) {
+  struct ip_protocol *p;
+
+  // check protocol is already registered
+  for (p = protocols; p; p = p->next) {
+    if (p->type == protocol) {
+      return -1;
+    }
+  }
+
+  // register new protocol
+  p = malloc(sizeof(struct ip_protocol));
+  p->next = protocols;
+  p->type = protocol;
+  p->handler = handler;
+  protocols = p;
+  return 0;
+}
+
 int ip_init(void) { return netdev_proto_register(NETDEV_PROTO_IP, ip_rx); }
