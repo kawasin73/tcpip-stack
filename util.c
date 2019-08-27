@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 void hexdump(FILE *fp, void *data, size_t size) {
@@ -39,6 +40,50 @@ void hexdump(FILE *fp, void *data, size_t size) {
   fprintf(fp,
           "+------+-------------------------------------------------+----------"
           "--------+\n");
+}
+
+/*
+ * QUEUE OPERATIONS
+ */
+
+int queue_push(struct queue_head *queue, void *data, size_t size) {
+  struct queue_entry *entry;
+  if (!queue || !data) {
+    return -1;
+  }
+  entry = malloc(sizeof(struct queue_entry));
+  if (!entry) {
+    return -1;
+  }
+  entry->data = data;
+  entry->size = size;
+  entry->next = NULL;
+  if (queue->tail) {
+    queue->tail->next = entry;
+  }
+  queue->tail = entry;
+  if (!queue->next) {
+    queue->next = entry;
+  }
+  queue->num++;
+  return 0;
+}
+
+int queue_pop(struct queue_head *queue, void **data, size_t *size) {
+  struct queue_entry *entry;
+  if (!queue || !queue->next) {
+    return -1;
+  }
+  entry = queue->next;
+  queue->next = entry->next;
+  if (!queue->next) {
+    queue->tail = NULL;
+  }
+  queue->num--;
+  *data = entry->data;
+  *size = entry->size;
+  free(entry);
+  return 0;
 }
 
 uint16_t cksum16(uint16_t *data, uint16_t size, uint32_t init) {
