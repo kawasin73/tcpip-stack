@@ -1,5 +1,5 @@
 TEST = test/raw_test test/ethernet_test test/ip_test test/mask_test \
-	test/tcp_test test/queue_test
+	test/tcp_test test/tcp_listen_test test/queue_test
 OBJS = raw.o util.o ethernet.o net.o ip.o arp.o tcp.o
 CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I . -DDEBUG -g
 

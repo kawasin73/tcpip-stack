@@ -1,4 +1,3 @@
-#include "tcp.h"
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -7,6 +6,7 @@
 #include "ip.h"
 #include "net.h"
 #include "raw.h"
+#include "tcp.h"
 
 static int setup(void) {
   if (ethernet_init() == -1) {
@@ -30,12 +30,12 @@ int main(int argc, char const *argv[]) {
   int signo;
   struct netdev *dev;
   struct netif *netif;
-  char *name = "tap1", *ipaddr = "192.168.33.11", *netmask = "255.255.0.0";
-  int soc;
+  char *name = "tap2", *ipaddr = "192.168.33.13", *netmask = "255.255.0.0";
+  int soc, listener;
 
-  sigemptyset(&sigset);
-  sigaddset(&sigset, SIGINT);
-  sigprocmask(SIG_BLOCK, &sigset, NULL);
+  // sigemptyset(&sigset);
+  // sigaddset(&sigset, SIGINT);
+  // sigprocmask(SIG_BLOCK, &sigset, NULL);
   if (setup() == -1) {
     return -1;
   }
@@ -57,34 +57,34 @@ int main(int argc, char const *argv[]) {
 
   dev->ops->run(dev);
 
-  ip_addr_t dst;
-  if (ip_addr_pton("192.168.33.10", &dst) != 0) {
-    fprintf(stderr, "ip_addr_pton: failed\n");
-    return -1;
-  }
-
-  soc = tcp_api_open();
-  if (soc == -1) {
+  listener = tcp_api_open();
+  if (listener == -1) {
     fprintf(stderr, "tcp_api_open: failed\n");
     return -1;
   }
 
-  fprintf(stderr, "sleep\n");
-  sleep(10);
-  fprintf(stderr, "start\n");
-
-  if (tcp_api_connect(soc, &dst, 19999) == -1) {
-    fprintf(stderr, "tcp_api_connect: failed\n");
+  if (tcp_api_bind(listener, 20000) == -1) {
+    fprintf(stderr, "tcp_api_bind: failed\n");
+    return -1;
+  }
+  if (tcp_api_listen(listener) == -1) {
+    fprintf(stderr, "tcp_api_listen: failed\n");
     return -1;
   }
 
-  fprintf(stderr, "tcp_api_connect success\n");
+  fprintf(stderr, "tcp_api_listen success\n");
 
   while (1) {
-    sigwait(&sigset, &signo);
-    if (signo == SIGINT) {
-      break;
+    soc = tcp_api_accept(listener);
+    if (!soc) {
+      fprintf(stderr, "tcp_api_accept: failed\n");
+      return -1;
     }
+    fprintf(stderr, "tcp_api_accept success\n");
+    // sigwait(&sigset, &signo);
+    // if (signo == SIGINT) {
+    //   break;
+    // }
   }
   if (dev->ops->close) {
     dev->ops->close(dev);

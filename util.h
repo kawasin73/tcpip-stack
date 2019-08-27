@@ -11,6 +11,9 @@
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #endif
 
+#define array_offset(array, x) \
+  (((uintptr_t)(x) - (uintptr_t)(array)) / sizeof(*x))
+
 struct queue_entry {
   void *data;
   size_t size;

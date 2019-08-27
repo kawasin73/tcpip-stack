@@ -32,6 +32,12 @@
 #define TCP_FLG_IS(x, y) (((x)&0x3f) == (y))
 #define TCP_FLG_ISSET(x, y) (((x)&0x3f) & (y))
 
+#ifndef TCP_DEBUG
+#ifdef DEBUG
+#define TCP_DEBUG 1
+#endif
+#endif
+
 struct tcp_hdr {
   uint16_t src;
   uint16_t dst;
@@ -48,10 +54,10 @@ struct tcp_cb {
   uint8_t used;
   uint8_t state;
   struct netif *iface;
-  uint16_t port; // network byte order
+  uint16_t port;  // network byte order
   struct {
     ip_addr_t addr;
-    uint16_t port; // network byte order
+    uint16_t port;  // network byte order
   } peer;
   struct {
     uint32_t nxt;
@@ -70,6 +76,7 @@ struct tcp_cb {
   uint32_t irs;
   uint8_t window[65535];
   struct tcp_cb *parent;
+  struct queue_head backlog;
   pthread_cond_t cond;
 };
 
@@ -136,10 +143,24 @@ static char *tcp_state_ntop(uint8_t state) {
   }
 }
 
+static void tcp_state_dump(struct tcp_cb *cb) {
+  char buf[64];
+
+  fprintf(stderr, "     state: %s\n", tcp_state_ntop(cb->state));
+  fprintf(stderr, " self.port: %u\n", ntoh16(cb->port));
+  fprintf(stderr, " peer.addr: %s\n", ip_addr_ntop(&cb->peer.addr, buf, 64));
+  fprintf(stderr, " peer.port: %u\n", ntoh16(cb->peer.port));
+  fprintf(stderr, "   snd.nxt: %u\n", cb->snd.nxt);
+  fprintf(stderr, "   snd.wnd: %u\n", cb->snd.wnd);
+  fprintf(stderr, "   rcv.nxt: %u\n", cb->rcv.nxt);
+  fprintf(stderr, "   rcv.wnd: %u\n", cb->rcv.wnd);
+  fprintf(stderr, " n_backlog: %u\n", cb->backlog.num);
+}
+
 static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr) {
   char buf[64];
 
-  fprintf(stderr, " state: %s\n", tcp_state_ntop(cb->state));
+  tcp_state_dump(cb);
   fprintf(stderr, " src: %u\n", ntoh16(hdr->src));
   fprintf(stderr, " dst: %u\n", ntoh16(hdr->dst));
   fprintf(stderr, " seq: %u\n", ntoh32(hdr->seq));
@@ -170,12 +191,50 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
     case TCP_CB_STATE_CLOSED:
       if (!TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
-          tcp_tx(cb,ntoh32( hdr->ack), 0, TCP_FLG_RST, NULL, 0);
+          tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, NULL, 0);
         } else {
-          tcp_tx(cb, 0, ntoh32(hdr->seq) + plen, TCP_FLG_RST | TCP_FLG_ACK, NULL, 0);
+          tcp_tx(cb, 0, ntoh32(hdr->seq) + plen, TCP_FLG_RST | TCP_FLG_ACK,
+                 NULL, 0);
         }
       }
-      break;
+      return;
+
+    case TCP_CB_STATE_LISTEN:
+      // first check for an RST
+      if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
+        // incoming RST is ignored
+        return;
+      }
+
+      // second check for an ACK
+      if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
+        tcp_tx(cb, hdr->ack, 0, TCP_FLG_RST, NULL, 0);
+        return;
+      }
+
+      // third check for a SYN
+      if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_SYN)) {
+        // TODO: check the security
+
+        // TODO: If the SEG.PRC is greater than the TCB.PRC
+
+        // else
+        cb->rcv.wnd = sizeof(cb->window);
+        cb->rcv.nxt = ntoh32(hdr->seq) + 1;
+        cb->irs = ntoh32(hdr->seq);
+        cb->iss = (uint32_t)random();
+        tcp_tx(cb, cb->iss, cb->rcv.nxt, TCP_FLG_SYN | TCP_FLG_ACK, NULL, 0);
+        cb->snd.nxt = cb->iss + 1;
+        cb->snd.una = cb->iss;
+        cb->used = 1;
+        cb->state = TCP_CB_STATE_SYN_RCVD;
+
+        // TODO: ?  queue to backlog ?
+        break;
+      }
+
+      // no packet should come here. drop segment
+      return;
 
     case TCP_CB_STATE_SYN_SENT:
       // first check the ACK bit
@@ -183,9 +242,13 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         if (ntoh32(hdr->ack) <= cb->iss || ntoh32(hdr->ack) > cb->snd.nxt) {
           tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, NULL, 0);
           return;
-        } else if (cb->snd.una <= ntoh32(hdr->ack) && ntoh32(hdr->ack) <= cb->snd.nxt) {
+        }
+        if (cb->snd.una <= ntoh32(hdr->ack) &&
+            ntoh32(hdr->ack) <= cb->snd.nxt) {
           acceptable = 1;
-          // TODO: ? if not acceptable ?
+        } else {
+          // drop invalid ack
+          return;
         }
       }
 
@@ -199,6 +262,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         cb->state = TCP_CB_STATE_CLOSED;
         // TODO: delete cb
         cb->used = 0;
+        pthread_cond_signal(&cb->cond);
         return;
       }
 
@@ -216,13 +280,15 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
           // our SYN has been ACKed
           cb->state = TCP_CB_STATE_ESTABLISHED;
           tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
-          if (!TCP_FLG_ISSET(hdr->flg, TCP_FLG_URG)) {
-            return;
+          pthread_cond_signal(&cb->cond);
+          if (plen > 0 || TCP_FLG_ISSET(hdr->flg, TCP_FLG_URG)) {
+            goto CHECK_URG;
           }
-          goto CHECK_URG;
+          return;
         } else {
           cb->state = TCP_CB_STATE_SYN_RCVD;
           tcp_tx(cb, cb->iss, cb->rcv.nxt, TCP_FLG_SYN | TCP_FLG_ACK, NULL, 0);
+          pthread_cond_signal(&cb->cond);
           // TODO: If there are other controls or text in the segment, queue
           // them for processing after the ESTABLISHED state has been reached,
           return;
@@ -237,13 +303,252 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
 
       return;
 
+    case TCP_CB_STATE_SYN_RCVD:
+    case TCP_CB_STATE_ESTABLISHED:
+    case TCP_CB_STATE_FIN_WAIT1:
+    case TCP_CB_STATE_FIN_WAIT2:
+    case TCP_CB_STATE_CLOSING:
+    case TCP_CB_STATE_TIME_WAIT:
+    case TCP_CB_STATE_CLOSE_WAIT:
+    case TCP_CB_STATE_LAST_ACK:
+      break;
+
     default:
       fprintf(stderr, ">>> not implement tcp state (%d) <<<\n", cb->state);
-
-    CHECK_URG:
-      // TODO: check the URG bit
       return;
   }
+
+  // first check sequence number
+  if (plen > 0) {
+    if (cb->rcv.wnd > 0) {
+      acceptable = (cb->rcv.nxt <= ntoh32(hdr->seq) &&
+                    ntoh32(hdr->seq) < cb->rcv.nxt + cb->rcv.wnd) ||
+                   (cb->rcv.nxt <= ntoh32(hdr->seq) &&
+                    ntoh32(hdr->seq) + plen - 1 < cb->rcv.nxt + cb->rcv.wnd);
+    } else {
+      acceptable = 0;
+    }
+  } else {
+    if (cb->rcv.wnd > 0) {
+      acceptable = (cb->rcv.nxt <= ntoh32(hdr->seq) &&
+                    ntoh32(hdr->seq) < cb->rcv.nxt + cb->rcv.wnd);
+    } else {
+      acceptable = ntoh32(hdr->seq) == cb->rcv.nxt;
+    }
+  }
+
+  if (!acceptable) {
+    if (!TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+    }
+    // drop segment
+    return;
+  }
+
+  // second check the RST bit
+  switch (cb->state) {
+    case TCP_CB_STATE_SYN_RCVD:
+      if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
+        // close connection
+        cb->used = 0;
+        cb->state = TCP_CB_STATE_CLOSED;
+        pthread_cond_signal(&cb->cond);
+        return;
+      }
+      break;
+
+    case TCP_CB_STATE_ESTABLISHED:
+    case TCP_CB_STATE_FIN_WAIT1:
+    case TCP_CB_STATE_FIN_WAIT2:
+    case TCP_CB_STATE_CLOSE_WAIT:
+      if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
+        // TODO: signal to SEND, RECEIVE waiting thread.
+        // TODO: ? use reference count for used ?
+        cb->used = 0;
+        cb->state = TCP_CB_STATE_CLOSED;
+        return;
+      }
+      break;
+    case TCP_CB_STATE_CLOSING:
+    case TCP_CB_STATE_TIME_WAIT:
+    case TCP_CB_STATE_LAST_ACK:
+      if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
+        // close connection
+        cb->used = 0;
+        cb->state = TCP_CB_STATE_CLOSED;
+        return;
+      }
+      break;
+  }
+
+  // TODO: third check security and precedence
+
+  // fourth, check the SYN bit
+  if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_SYN)) {
+    // TODO: signal
+    tcp_tx(cb, 0, cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
+    cb->used = 0;
+    cb->state = TCP_CB_STATE_CLOSED;
+    return;
+  }
+  // TODO: ? If the SYN is not in the window this step would not be reached and
+  // an ack would have been sent in the first step (sequence number check). ?
+
+  // fifth check the ACK field
+  if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
+    switch (cb->state) {
+      case TCP_CB_STATE_SYN_RCVD:
+        if (cb->snd.una <= ntoh32(hdr->ack) &&
+            ntoh32(hdr->ack) <= cb->snd.nxt) {
+          cb->state = TCP_CB_STATE_ESTABLISHED;
+          // add cb to backlog
+          queue_push(&cb->parent->backlog, cb, sizeof(*cb));
+          pthread_cond_signal(&cb->parent->cond);
+        } else {
+          tcp_tx(cb, hdr->ack, cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
+        }
+        break;
+
+      case TCP_CB_STATE_ESTABLISHED:
+      case TCP_CB_STATE_FIN_WAIT1:
+      case TCP_CB_STATE_FIN_WAIT2:
+      case TCP_CB_STATE_CLOSE_WAIT:
+        if (cb->snd.una <= ntoh32(hdr->ack) &&
+            ntoh32(hdr->ack) <= cb->snd.nxt) {
+          cb->snd.una = hdr->ack;
+          // TODO: retransmission queue send
+
+          if ((cb->snd.wl1 < ntoh32(hdr->seq)) ||
+              (cb->snd.wl1 == ntoh32(hdr->seq) &&
+               cb->snd.wl2 <= ntoh32(hdr->ack))) {
+            cb->snd.wnd = ntoh16(hdr->win);
+            cb->snd.wl1 = ntoh32(hdr->seq);
+            cb->snd.wl2 = ntoh32(hdr->ack);
+          }
+        } else if (ntoh32(hdr->ack) > cb->snd.nxt) {
+          tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+          // drop the segment
+          return;
+        }
+        // else if SEG.ACK < SND.UNA then it can be ignored
+
+        if (cb->state == TCP_CB_STATE_FIN_WAIT1) {
+          // if this ACK is for sent FIN
+          if (ntoh32(hdr->ack) + 1 == cb->snd.nxt) {
+            cb->state = TCP_CB_STATE_FIN_WAIT2;
+          }
+        } else if (cb->state == TCP_CB_STATE_FIN_WAIT2) {
+          // TODO: if the retransmission queue is empty, the user's CLOSE can be
+          // acknowledged ("ok")
+        } else if (cb->state == TCP_CB_STATE_CLOSING) {
+          // if this ACK is for sent FIN
+          if (ntoh32(hdr->ack) + 1 == cb->snd.nxt) {
+            cb->state = TCP_CB_STATE_TIME_WAIT;
+          }
+        }
+
+        break;
+
+      case TCP_CB_STATE_LAST_ACK:
+        // if this ACK is for sent FIN
+        if (ntoh32(hdr->ack) == cb->snd.nxt) {
+          cb->state = TCP_CB_STATE_CLOSED;
+          cb->used = 0;
+          return;
+        }
+        break;
+
+      case TCP_CB_STATE_TIME_WAIT:
+        // TODO: restart the 2 MSL timeout
+        break;
+    }
+  }
+
+CHECK_URG:
+  // sixth, check the URG bit
+  if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_URG)) {
+    switch (cb->state) {
+      case TCP_CB_STATE_ESTABLISHED:
+      case TCP_CB_STATE_FIN_WAIT1:
+      case TCP_CB_STATE_FIN_WAIT2:
+        cb->rcv.up = MAX(cb->rcv.up, hdr->urg);
+        // TODO: signal
+
+        break;
+
+      case TCP_CB_STATE_CLOSING:
+      case TCP_CB_STATE_TIME_WAIT:
+      case TCP_CB_STATE_CLOSE_WAIT:
+      case TCP_CB_STATE_LAST_ACK:
+        // this should not occur. ignore the urg
+        break;
+
+      case TCP_CB_STATE_SYN_RCVD:
+        // do nothing
+        break;
+    }
+  }
+
+  // seventh, process the segment text
+  switch (cb->state) {
+    case TCP_CB_STATE_ESTABLISHED:
+    case TCP_CB_STATE_FIN_WAIT1:
+    case TCP_CB_STATE_FIN_WAIT2:
+      // copy segment to receive buffer
+      memcpy(cb->window + (sizeof(cb->window) - cb->rcv.wnd),
+             (uint8_t *)hdr + hlen, plen);
+      cb->rcv.nxt = ntoh32(hdr->seq) + plen;
+      cb->rcv.wnd -= plen;
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+      pthread_cond_signal(&cb->cond);
+      break;
+
+    case TCP_CB_STATE_CLOSING:
+    case TCP_CB_STATE_TIME_WAIT:
+    case TCP_CB_STATE_CLOSE_WAIT:
+    case TCP_CB_STATE_LAST_ACK:
+      // this should not occur. ignore the text
+      break;
+
+    case TCP_CB_STATE_SYN_RCVD:
+      // do nothing
+      break;
+  }
+
+  // eighth, check the FIN bit
+  if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_FIN)) {
+    // TODO: signal "connection closing"
+    cb->rcv.nxt = ntoh32(hdr->seq) + 1;
+    tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+    switch (cb->state) {
+      case TCP_CB_STATE_SYN_RCVD:
+      case TCP_CB_STATE_ESTABLISHED:
+        cb->state = TCP_CB_STATE_CLOSE_WAIT;
+        break;
+
+      case TCP_CB_STATE_FIN_WAIT1:
+        cb->state = TCP_CB_STATE_CLOSING;
+        break;
+
+      case TCP_CB_STATE_FIN_WAIT2:
+        cb->state = TCP_CB_STATE_TIME_WAIT;
+        // TODO: start time-wait timer
+        // TODO: turn off other timers
+        break;
+
+      case TCP_CB_STATE_CLOSING:
+      case TCP_CB_STATE_CLOSE_WAIT:
+      case TCP_CB_STATE_LAST_ACK:
+        // remain state
+        break;
+
+      case TCP_CB_STATE_TIME_WAIT:
+        // remain state
+        // TODO: restart the 2MSL timeout
+        break;
+    }
+  }
+  return;
 }
 
 /*
@@ -328,9 +633,11 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
   // find connection cb or listener cb
   for (i = 0; i < TCP_CB_TABLE_SIZE; i++) {
     cb = &cb_table[i];
-    if (!cb->used && cb->state == TCP_CB_STATE_CLOSED) {
+    if (!cb->used) {
       // cache cb for the case SYN message and no cb is connected to this peer
-      fcb = cb;
+      if (fcb == NULL) {
+        fcb = cb;
+      }
     } else if ((!cb->iface || cb->iface == iface) && cb->port == hdr->dst) {
       // if ip address and dst port number matches
       if (cb->peer.addr == *src && cb->peer.port == hdr->src) {
@@ -352,22 +659,20 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
       pthread_mutex_unlock(&mutex);
       return;
     }
+
     // create accept socket
     cb = fcb;
     cb->iface = iface;
     if (lcb) {
       // TODO: ? if SYN is not set ?
-      cb->used = 1;
       cb->state = lcb->state;
       cb->port = lcb->port;
-      cb->rcv.wnd = sizeof(cb->window);
       cb->parent = lcb;
     } else {
       // this port is not listened.
       // this packet is invalid. no connection is found.
-      cb->used = 0;
+      cb->state = TCP_CB_STATE_CLOSED;
       cb->port = 0;
-      cb->rcv.wnd = 0;
     }
     cb->peer.addr = *src;
     cb->peer.port = hdr->src;
@@ -483,9 +788,88 @@ int tcp_api_connect(int soc, ip_addr_t *addr, uint16_t port) {
   return 0;
 }
 
-int tcp_api_bind(int soc, uint16_t port);
-int tcp_api_listen(int soc);
-int tcp_api_accept(int soc);
+int tcp_api_bind(int soc, uint16_t port) {
+  struct tcp_cb *cb;
+  int i;
+
+  // validate soc id
+  if (TCP_SOCKET_INVALID(soc)) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&mutex);
+
+  // check port is already used
+  for (i = 0; i < TCP_CB_TABLE_SIZE; i++) {
+    if (cb_table[i].port == hton16(port)) {
+      pthread_mutex_unlock(&mutex);
+      fprintf(stderr, "error:  port is already used\n");
+      return -1;
+    }
+  }
+
+  // check cb is closed
+  cb = &cb_table[soc];
+  if (!cb->used || cb->state != TCP_CB_STATE_CLOSED) {
+    pthread_mutex_unlock(&mutex);
+    return -1;
+  }
+
+  // TODO: bind ip address
+
+  // set port number
+  cb->port = hton16(port);
+  pthread_mutex_unlock(&mutex);
+  return 0;
+}
+
+int tcp_api_listen(int soc) {
+  struct tcp_cb *cb;
+  int i;
+
+  // validate soc id
+  if (TCP_SOCKET_INVALID(soc)) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&mutex);
+  cb = &cb_table[soc];
+  if (!cb->used || cb->state != TCP_CB_STATE_CLOSED || !cb->port) {
+    pthread_mutex_unlock(&mutex);
+    return -1;
+  }
+  cb->state = TCP_CB_STATE_LISTEN;
+  pthread_mutex_unlock(&mutex);
+  return 0;
+}
+
+int tcp_api_accept(int soc) {
+  struct tcp_cb *cb, *backlog = NULL;
+  size_t size;
+
+  // validate soc id
+  if (TCP_SOCKET_INVALID(soc)) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&mutex);
+  cb = &cb_table[soc];
+  if (!cb->used || cb->state != TCP_CB_STATE_LISTEN) {
+    pthread_mutex_unlock(&mutex);
+    return -1;
+  }
+
+  while (cb->state == TCP_CB_STATE_LISTEN &&
+         queue_pop(&cb->backlog, &backlog, &size) == -1) {
+    pthread_cond_wait(&cb->cond, &mutex);
+  }
+
+  pthread_mutex_unlock(&mutex);
+  if (!backlog) {
+    return -1;
+  }
+  return array_offset(cb_table, backlog);
+}
 ssize_t tcp_api_recv(int soc, uint8_t *buf, size_t size);
 ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len);
 
