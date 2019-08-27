@@ -40,6 +40,7 @@ struct ip_protocol {
                   struct netif *netif);
 };
 
+static struct netif *default_netif = NULL;
 static struct ip_protocol *protocols = NULL;
 static struct ip_fragment *fragments = NULL;
 static int ip_forwarding = 0;
@@ -234,6 +235,70 @@ static struct ip_fragment *ip_fragment_process(struct ip_hdr *hdr,
   count--;
   pthread_mutex_unlock(&mutex);
   return fragment;
+}
+
+/*
+ * IP INTERFACE
+ */
+
+struct netif *ip_netif_register(struct netdev *dev, const char *addr,
+                                const char *netmask, const char *gateway) {
+  struct netif_ip *iface;
+  ip_addr_t gw;
+
+  iface = malloc(sizeof(struct netif_ip));
+  if (!iface) {
+    return NULL;
+  }
+
+  // set netif_ip parameters
+  ((struct netif *)iface)->next = NULL;
+  ((struct netif *)iface)->family = NETIF_FAMILY_IPV4;
+  ((struct netif *)iface)->dev = NULL;
+  if (ip_addr_pton(addr, &iface->unicast) == -1) {
+    goto ERR_SETUP_NETIF;
+  }
+  if (ip_addr_pton(netmask, &iface->netmask) == -1) {
+    goto ERR_SETUP_NETIF;
+  }
+  iface->network = iface->unicast & iface->netmask;
+  iface->broadcast = iface->network | ~iface->netmask;
+
+  // TODO : register to route table
+  default_netif = (struct netif *)iface;
+  // TODO : set gateway
+
+  // register netdev
+  if (netdev_add_netif(dev, (struct netif *)iface) == -1) {
+    goto ERR_SETUP_NETIF;
+  }
+
+  return (struct netif *)iface;
+
+ERR_SETUP_NETIF:
+  free(iface);
+  return NULL;
+}
+
+struct netif *ip_netif_by_addr(ip_addr_t *addr) {
+  struct netdev *dev;
+  struct netif *entry;
+
+  for (dev = netdev_root(); dev; dev = dev->next) {
+    for (entry = dev->ifs; entry; entry = entry->next) {
+      if (entry->family == NETIF_FAMILY_IPV4 &&
+          ((struct netif_ip *)entry)->unicast == *addr) {
+        return entry;
+      }
+    }
+  }
+  return NULL;
+}
+
+struct netif *ip_netif_by_peer(ip_addr_t *peer) {
+  // TODO: find netif from routing table
+
+  return default_netif;
 }
 
 /*

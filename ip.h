@@ -52,6 +52,11 @@ extern const ip_addr_t IPADDR_BROADCAST;
 int ip_addr_pton(const char *p, ip_addr_t *n);
 char *ip_addr_ntop(const ip_addr_t *n, char *p, size_t size);
 
+struct netif *ip_netif_register(struct netdev *dev, const char *addr,
+                                const char *netmask, const char *gateway);
+struct netif *ip_netif_by_addr(ip_addr_t *addr);
+struct netif *ip_netif_by_peer(ip_addr_t *peer);
+
 ssize_t ip_tx(struct netif *netif, uint8_t protocol, const uint8_t *buf,
               size_t len, const ip_addr_t *dst);
 int ip_add_protocol(uint8_t protocol,
