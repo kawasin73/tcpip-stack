@@ -77,6 +77,11 @@ static uint16_t byteswap16(uint16_t v) {
   return (v & 0x00ff) << 8 | (v & 0xff00) >> 8;
 }
 
+static uint32_t byteswap32(uint32_t v) {
+  return (v & 0x000000ff) << 24 | (v & 0x0000ff00) << 8 |
+         (v & 0x00ff0000) >> 8 | (v & 0xff000000) >> 24;
+}
+
 uint16_t hton16(uint16_t h) {
   if (!endian) {
     endian = byteorder();
@@ -89,6 +94,20 @@ uint16_t ntoh16(uint16_t n) {
     endian = byteorder();
   }
   return endian == __LITTLE_ENDIAN ? byteswap16(n) : n;
+}
+
+uint32_t hton32(uint32_t h) {
+  if (!endian) {
+    endian = byteorder();
+  }
+  return endian == __LITTLE_ENDIAN ? byteswap32(h) : h;
+}
+
+uint32_t ntoh32(uint32_t n) {
+  if (!endian) {
+    endian = byteorder();
+  }
+  return endian == __LITTLE_ENDIAN ? byteswap32(n) : n;
 }
 
 void maskset(uint32_t *mask, size_t size, size_t offset, size_t len) {
