@@ -13,7 +13,7 @@ static void dump(uint8_t *frame, size_t len, void *arg) {
 }
 
 int main(int argc, char const *argv[]) {
-  char *name = "eth1";
+  char *name = "tap1";
   struct rawdev *dev;
   uint8_t addr[6];
 

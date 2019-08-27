@@ -3,9 +3,9 @@ OBJS = raw.o util.o ethernet.o net.o ip.o arp.o
 CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I . -DDEBUG -g
 
 ifeq ($(shell uname), Linux)
-	OBJS := $(OBJS) raw/soc.o
-	TEST := $(TEST) test/raw_soc_test
-	CFLAGS := $(CFLAGS) -pthread -DHAVE_PF_PACKET
+	OBJS := $(OBJS) raw/soc.o raw/tap_linux.o
+	TEST := $(TEST) test/raw_soc_test test/raw_tap_test
+	CFLAGS := $(CFLAGS) -pthread -DHAVE_PF_PACKET -DHAVE_TAP
 endif
 
 .PHONY: all clean

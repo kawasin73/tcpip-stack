@@ -17,7 +17,7 @@ int main(int argc, char const *argv[]) {
   sigset_t sigset;
   int signo;
   struct netdev *dev;
-  char *name = "eth1";
+  char *name = "tap1";
 
   sigemptyset(&sigset);
   sigaddset(&sigset, SIGINT);
