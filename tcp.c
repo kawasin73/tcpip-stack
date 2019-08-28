@@ -212,7 +212,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
 
       // second check for an ACK
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
-        tcp_tx(cb, hdr->ack, 0, TCP_FLG_RST, NULL, 0);
+        tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, NULL, 0);
         goto ERROR_RX_LISTEN;
       }
 
@@ -415,7 +415,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
             pthread_cond_signal(&cb->cond);
           }
         } else {
-          tcp_tx(cb, hdr->ack, cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
+          tcp_tx(cb, ntoh32(hdr->ack), cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
         }
         break;
 
@@ -425,7 +425,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       case TCP_CB_STATE_CLOSE_WAIT:
         if (cb->snd.una <= ntoh32(hdr->ack) &&
             ntoh32(hdr->ack) <= cb->snd.nxt) {
-          cb->snd.una = hdr->ack;
+          cb->snd.una = ntoh32(hdr->ack);
           // TODO: retransmission queue send
 
           if ((cb->snd.wl1 < ntoh32(hdr->seq)) ||
@@ -480,7 +480,7 @@ CHECK_URG:
       case TCP_CB_STATE_ESTABLISHED:
       case TCP_CB_STATE_FIN_WAIT1:
       case TCP_CB_STATE_FIN_WAIT2:
-        cb->rcv.up = MAX(cb->rcv.up, hdr->urg);
+        cb->rcv.up = MAX(cb->rcv.up, ntoh16(hdr->urg));
         // TODO: signal
 
         break;
@@ -504,17 +504,17 @@ CHECK_URG:
     case TCP_CB_STATE_FIN_WAIT1:
     case TCP_CB_STATE_FIN_WAIT2:
       // TODO: accept not ordered packet
-      if (plen > 0 && cb->rcv.nxt == hdr->seq) {
+      if (plen > 0 && cb->rcv.nxt == ntoh32(hdr->seq)) {
         // copy segment to receive buffer
         memcpy(cb->window + (sizeof(cb->window) - cb->rcv.wnd),
                (uint8_t *)hdr + hlen, plen);
         cb->rcv.nxt = ntoh32(hdr->seq) + plen;
         cb->rcv.wnd -= plen;
         tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
-        pthread_cond_signal(&cb->cond);
+        pthread_cond_broadcast(&cb->cond);
       } else if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_PSH)) {
         tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
-        pthread_cond_signal(&cb->cond);
+        pthread_cond_broadcast(&cb->cond);
       }
       break;
 
