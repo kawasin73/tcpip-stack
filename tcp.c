@@ -410,7 +410,8 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       break;
 
     default:
-      fprintf(stderr, ">>> not implement tcp state (%d) <<<\n", cb->state);
+      fprintf(stderr, ">>> segment recv : not implement tcp state (%d) <<<\n",
+              cb->state);
       return;
   }
 
@@ -464,6 +465,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         return;
       }
       break;
+
     case TCP_CB_STATE_CLOSING:
     case TCP_CB_STATE_TIME_WAIT:
     case TCP_CB_STATE_LAST_ACK:
@@ -473,6 +475,11 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         pthread_cond_broadcast(&cb->cond);
         return;
       }
+      break;
+
+    default:
+      fprintf(stderr, ">>> seg recv (2) : not implement tcp state (%d) <<<\n",
+              cb->state);
       break;
   }
 
@@ -513,6 +520,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       case TCP_CB_STATE_FIN_WAIT1:
       case TCP_CB_STATE_FIN_WAIT2:
       case TCP_CB_STATE_CLOSE_WAIT:
+      case TCP_CB_STATE_CLOSING:
         if (cb->snd.una <= ntoh32(hdr->ack) &&
             ntoh32(hdr->ack) <= cb->snd.nxt) {
           if (cb->snd.una < ntoh32(hdr->ack)) {
@@ -566,6 +574,11 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       case TCP_CB_STATE_TIME_WAIT:
         // TODO: restart the 2 MSL timeout
         break;
+
+      default:
+        fprintf(stderr, ">>> seg recv (5) : not implement tcp state (%d) <<<\n",
+                cb->state);
+        break;
     }
   }
 
@@ -590,6 +603,11 @@ CHECK_URG:
 
       case TCP_CB_STATE_SYN_RCVD:
         // do nothing
+        break;
+
+      default:
+        fprintf(stderr, ">>> seg recv (6) : not implement tcp state (%d) <<<\n",
+                cb->state);
         break;
     }
   }
@@ -624,6 +642,11 @@ CHECK_URG:
     case TCP_CB_STATE_SYN_RCVD:
       // do nothing
       break;
+
+    default:
+      fprintf(stderr, ">>> seg recv (7) : not implement tcp state (%d) <<<\n",
+              cb->state);
+      break;
   }
 
   // eighth, check the FIN bit
@@ -657,6 +680,11 @@ CHECK_URG:
         // remain state
         // restart the 2MSL timeout
         cb->timeout = now.tv_sec + TIME_WAIT_TIMEOUT;
+        break;
+
+      default:
+        fprintf(stderr, ">>> seg recv (8) : not implement tcp state (%d) <<<\n",
+                cb->state);
         break;
     }
     // signal "connection closing"
