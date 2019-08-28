@@ -1,6 +1,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include "ip.h"
@@ -164,13 +165,13 @@ static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr, size_t plen) {
   char buf[64];
 
   tcp_state_dump(cb);
-  fprintf(stderr, " len: %u\n", plen);
+  fprintf(stderr, " len: %lu\n", plen);
   fprintf(stderr, " src: %u\n", ntoh16(hdr->src));
   fprintf(stderr, " dst: %u\n", ntoh16(hdr->dst));
   fprintf(stderr, " seq: %u\n", ntoh32(hdr->seq));
   fprintf(stderr, " ack: %u\n", ntoh32(hdr->ack));
   fprintf(stderr, " off: %u\n", hdr->off);
-  fprintf(stderr, " flg: [%s]\n", tcp_flg_ntop(hdr->flg, &buf, 64));
+  fprintf(stderr, " flg: [%s]\n", tcp_flg_ntop(hdr->flg, buf, 64));
   fprintf(stderr, " win: %u\n", ntoh16(hdr->win));
   fprintf(stderr, " sum: %u\n", ntoh16(hdr->sum));
   fprintf(stderr, " urg: %u\n", ntoh16(hdr->urg));
@@ -185,7 +186,6 @@ static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr, size_t plen) {
 // https://tools.ietf.org/html/rfc793#page-65
 static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
                                       size_t len) {
-  uint32_t seq, ack;
   size_t hlen, plen;
   int acceptable = 0;
 
@@ -265,7 +265,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
           // drop segment
           return;
         }
-        sprintf(stderr, "error: connection reset\n");
+        fprintf(stderr, "error: connection reset\n");
         cb->state = TCP_CB_STATE_CLOSED;
         // TODO: delete cb
         pthread_cond_signal(&cb->cond);
@@ -735,7 +735,7 @@ int tcp_close(struct tcp_cb *cb) {
 
     case TCP_CB_STATE_LISTEN:
       // close all cb in backlog
-      while (queue_pop(&cb->backlog, &backlog, &size) != -1) {
+      while (queue_pop(&cb->backlog, (void **)&backlog, &size) != -1) {
         tcp_close(backlog);
       }
     case TCP_CB_STATE_SYN_SENT:
@@ -903,7 +903,6 @@ int tcp_api_bind(int soc, uint16_t port) {
 
 int tcp_api_listen(int soc) {
   struct tcp_cb *cb;
-  int i;
 
   // validate soc id
   if (TCP_SOCKET_INVALID(soc)) {
@@ -938,7 +937,7 @@ int tcp_api_accept(int soc) {
   }
 
   while (cb->state == TCP_CB_STATE_LISTEN &&
-         queue_pop(&cb->backlog, &backlog, &size) == -1) {
+         queue_pop(&cb->backlog, (void **)&backlog, &size) == -1) {
     pthread_cond_wait(&cb->cond, &mutex);
   }
 

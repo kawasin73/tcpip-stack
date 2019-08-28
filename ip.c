@@ -244,7 +244,6 @@ static struct ip_fragment *ip_fragment_process(struct ip_hdr *hdr,
 struct netif *ip_netif_register(struct netdev *dev, const char *addr,
                                 const char *netmask, const char *gateway) {
   struct netif_ip *iface;
-  ip_addr_t gw;
 
   iface = malloc(sizeof(struct netif_ip));
   if (!iface) {
@@ -457,7 +456,6 @@ static uint16_t ip_generate_id(void) {
 
 ssize_t ip_tx(struct netif *netif, uint8_t protocol, const uint8_t *buf,
               size_t len, const ip_addr_t *dst) {
-  struct ip_route *route;
   ip_addr_t *nexthop = NULL, *src = NULL;
   uint16_t id, flag, offset;
   size_t done, slen;
