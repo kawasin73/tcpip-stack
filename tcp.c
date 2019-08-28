@@ -7,6 +7,10 @@
 #include "ip.h"
 #include "util.h"
 
+// TODO: user timeout should set by user
+#define USER_TIMEOUT (10)          /* user timeout (seconds) */
+#define TIME_WAIT_TIMEOUT (2 * 10) /* TIME_WAIT timeout (seconds) */
+
 #define TCP_CB_TABLE_SIZE 128
 #define TCP_SOURCE_PORT_MIN 49152
 #define TCP_SOURCE_PORT_MAX 65535
@@ -47,8 +51,6 @@
     memset(&(cb)->rcv, 0, MEMBER_SIZE(struct tcp_cb, rcv)); \
     (cb)->irs = 0;                                          \
   } while (0)
-
-#define USER_TIMEOUT (60 * 1000)
 
 #ifndef TCP_DEBUG
 #ifdef DEBUG
@@ -96,6 +98,7 @@ struct tcp_cb {
   struct tcp_cb *parent;
   struct queue_head backlog;
   pthread_cond_t cond;
+  long timeout;
 };
 
 static struct tcp_cb cb_table[TCP_CB_TABLE_SIZE];
@@ -201,9 +204,15 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
                                       size_t len) {
   size_t hlen, plen;
   int acceptable = 0;
+  struct timeval now;
 
   hlen = (hdr->off >> 4) << 2;
   plen = len - hlen;
+  if (gettimeofday(&now, NULL) == -1) {
+    perror("gettimeofday");
+    return;
+  }
+
   switch (cb->state) {
     case TCP_CB_STATE_CLOSED:
       if (!TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
@@ -243,6 +252,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         tcp_tx(cb, cb->iss, cb->rcv.nxt, TCP_FLG_SYN | TCP_FLG_ACK, NULL, 0);
         cb->snd.nxt = cb->iss + 1;
         cb->snd.una = cb->iss;
+        cb->timeout = now.tv_sec + USER_TIMEOUT;
         cb->state = TCP_CB_STATE_SYN_RCVD;
 
         // TODO: ?  queue to backlog ?
@@ -293,7 +303,12 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         cb->rcv.nxt = ntoh32(hdr->seq) + 1;
         cb->irs = ntoh32(hdr->seq);
         // TODO: ? if there is an ACK ?
-        cb->snd.una = ntoh32(hdr->ack);
+        if (cb->snd.una < ntoh32(hdr->ack)) {
+          // update snd.una and user timeout
+          cb->snd.una = ntoh32(hdr->ack);
+          cb->timeout = now.tv_sec + USER_TIMEOUT;
+        }
+
         // TODO: clear all retransmission queue
 
         if (cb->snd.una > cb->iss) {
@@ -439,7 +454,11 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       case TCP_CB_STATE_CLOSE_WAIT:
         if (cb->snd.una <= ntoh32(hdr->ack) &&
             ntoh32(hdr->ack) <= cb->snd.nxt) {
-          cb->snd.una = ntoh32(hdr->ack);
+          if (cb->snd.una < ntoh32(hdr->ack)) {
+            // update snd.una and user timeout
+            cb->snd.una = ntoh32(hdr->ack);
+            cb->timeout = now.tv_sec + USER_TIMEOUT;
+          }
           // TODO: retransmission queue send
 
           if ((cb->snd.wl1 < ntoh32(hdr->seq)) ||
@@ -562,7 +581,8 @@ CHECK_URG:
 
       case TCP_CB_STATE_FIN_WAIT2:
         cb->state = TCP_CB_STATE_TIME_WAIT;
-        // TODO: start time-wait timer
+        // start time-wait timer
+        cb->timeout = now.tv_sec + TIME_WAIT_TIMEOUT;
         // TODO: turn off other timers
         break;
 
@@ -574,7 +594,8 @@ CHECK_URG:
 
       case TCP_CB_STATE_TIME_WAIT:
         // remain state
-        // TODO: restart the 2MSL timeout
+        // restart the 2MSL timeout
+        cb->timeout = now.tv_sec + TIME_WAIT_TIMEOUT;
         break;
     }
     // signal "connection closing"
@@ -721,6 +742,35 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
   return;
 }
 
+static void *tcp_timer_thread(void *arg) {
+  struct timeval timestamp;
+  struct tcp_cb *cb;
+  int i;
+
+  while (1) {
+    gettimeofday(&timestamp, NULL);
+    pthread_mutex_lock(&mutex);
+    for (i = 0; i < TCP_CB_TABLE_SIZE; i++) {
+      cb = &cb_table[i];
+      if (cb->snd.una == cb->snd.nxt && cb->state != TCP_CB_STATE_TIME_WAIT) {
+        continue;
+      }
+      if (cb->timeout < timestamp.tv_sec) {
+        // force close connection because of ack timeout or TIME_WAIT timeout
+        TCP_CLOSE_CB(cb);
+        pthread_cond_broadcast(&cb->cond);
+      }
+    }
+    pthread_mutex_unlock(&mutex);
+    // sleep 100 ms
+    usleep(100 * 1000);
+  }
+
+  return NULL;
+
+  return NULL;
+}
+
 /*
  * TCP APPLICATION INTERFACE
  */
@@ -822,6 +872,7 @@ int tcp_api_close(int soc) {
 
 int tcp_api_connect(int soc, ip_addr_t *addr, uint16_t port) {
   struct tcp_cb *cb, *tmp;
+  struct timeval now;
   int i, j;
   int offset;
 
@@ -836,6 +887,11 @@ int tcp_api_connect(int soc, ip_addr_t *addr, uint16_t port) {
   // check cb state
   if (!cb->used || cb->state != TCP_CB_STATE_CLOSED) {
     pthread_mutex_unlock(&mutex);
+    return -1;
+  }
+
+  if (gettimeofday(&now, NULL) == -1) {
+    perror("gettimeofday");
     return -1;
   }
 
@@ -874,12 +930,15 @@ int tcp_api_connect(int soc, ip_addr_t *addr, uint16_t port) {
   }
   cb->rcv.wnd = sizeof(cb->window);
   cb->iss = (uint32_t)random();
+
+  // send SYN packet
   if (tcp_tx(cb, cb->iss, 0, TCP_FLG_SYN, NULL, 0) == -1) {
     pthread_mutex_unlock(&mutex);
     return -1;
   }
   cb->snd.una = cb->iss;
   cb->snd.nxt = cb->iss + 1;
+  cb->timeout = now.tv_sec + USER_TIMEOUT;
   cb->state = TCP_CB_STATE_SYN_SENT;
 
   // wait until state change
@@ -1048,6 +1107,7 @@ ERROR_RECEIVE:
 
 ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len) {
   struct tcp_cb *cb;
+  struct timeval now;
   char *err;
 
   // validate soc id
@@ -1077,11 +1137,21 @@ ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len) {
 
     case TCP_CB_STATE_CLOSE_WAIT:
     case TCP_CB_STATE_ESTABLISHED:
+
+      // TODO: flow control
+
+      if (gettimeofday(&now, NULL) == -1) {
+        perror("gettimeofday");
+        pthread_mutex_unlock(&mutex);
+        return -1;
+      }
+
       if (len > 1500 - 60) {
         len = 1500 - 60;
       }
       // TODO: send in sending thread
       tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_PSH | TCP_FLG_ACK, buf, len);
+      cb->timeout = now.tv_sec + USER_TIMEOUT;
       cb->snd.nxt += len;
       pthread_mutex_unlock(&mutex);
       // TODO: support urg pointer
@@ -1118,8 +1188,8 @@ int tcp_init(void) {
   if (ip_add_protocol(IP_PROTOCOL_TCP, tcp_rx) == -1) {
     return -1;
   }
-  // if (pthread_create(&timer_thread, NULL, tcp_timer_thread, NULL) == -1) {
-  //   return -1;
-  // }
+  if (pthread_create(&timer_thread, NULL, tcp_timer_thread, NULL) == -1) {
+    return -1;
+  }
   return 0;
 }
