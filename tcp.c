@@ -8,7 +8,7 @@
 #include "util.h"
 
 // TODO: user timeout should set by user
-#define USER_TIMEOUT (10)          /* user timeout (seconds) */
+#define USER_TIMEOUT (20)          /* user timeout (seconds) */
 #define TIME_WAIT_TIMEOUT (2 * 10) /* TIME_WAIT timeout (seconds) */
 
 #define TCP_CB_TABLE_SIZE 128
@@ -50,6 +50,7 @@
     (cb)->iss = 0;                                          \
     memset(&(cb)->rcv, 0, MEMBER_SIZE(struct tcp_cb, rcv)); \
     (cb)->irs = 0;                                          \
+    tcp_txq_clear_all(cb);                                  \
   } while (0)
 
 #ifndef TCP_DEBUG
@@ -68,6 +69,18 @@ struct tcp_hdr {
   uint16_t win;
   uint16_t sum;
   uint16_t urg;
+};
+
+struct tcp_txq_entry {
+  struct tcp_hdr *segment;
+  uint16_t len;
+  struct timeval timestamp;
+  struct tcp_txq_entry *next;
+};
+
+struct tcp_txq_head {
+  struct tcp_txq_entry *head;
+  struct tcp_txq_entry *tail;
 };
 
 struct tcp_cb {
@@ -94,6 +107,7 @@ struct tcp_cb {
     uint16_t wnd;
   } rcv;
   uint32_t irs;
+  struct tcp_txq_head txq;
   uint8_t window[65535];
   struct tcp_cb *parent;
   struct queue_head backlog;
@@ -106,7 +120,8 @@ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t timer_thread;
 
 static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
-                      uint8_t flg, uint8_t *buf, size_t len);
+                      uint8_t flg, struct timeval *now, uint8_t *buf,
+                      size_t len);
 
 static char *tcp_flg_ntop(uint8_t flg, char *buf, int len) {
   int i = 0;
@@ -171,10 +186,12 @@ static void tcp_state_dump(struct tcp_cb *cb) {
   fprintf(stderr, " peer.addr: %s\n", ip_addr_ntop(&cb->peer.addr, buf, 64));
   fprintf(stderr, " peer.port: %u\n", ntoh16(cb->peer.port));
   fprintf(stderr, "   snd.nxt: %u\n", cb->snd.nxt);
+  fprintf(stderr, "   snd.una: %u\n", cb->snd.una);
   fprintf(stderr, "   snd.wnd: %u\n", cb->snd.wnd);
   fprintf(stderr, "   rcv.nxt: %u\n", cb->rcv.nxt);
   fprintf(stderr, "   rcv.wnd: %u\n", cb->rcv.wnd);
   fprintf(stderr, " n_backlog: %u\n", cb->backlog.num);
+  fprintf(stderr, "   timeout: %ld\n", cb->timeout);
 }
 
 static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr, size_t plen) {
@@ -191,6 +208,50 @@ static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr, size_t plen) {
   fprintf(stderr, " win: %u\n", ntoh16(hdr->win));
   fprintf(stderr, " sum: %u\n", ntoh16(hdr->sum));
   fprintf(stderr, " urg: %u\n", ntoh16(hdr->urg));
+}
+
+/*
+ * Segment Queue
+ */
+
+static int tcp_txq_add(struct tcp_cb *cb, struct tcp_hdr *hdr,
+                       struct timeval *now, size_t len) {
+  struct tcp_txq_entry *txq;
+
+  txq = malloc(sizeof(struct tcp_txq_entry));
+  if (!txq) {
+    return -1;
+  }
+  txq->segment = malloc(len);
+  if (!txq->segment) {
+    free(txq);
+    return -1;
+  }
+  memcpy(txq->segment, hdr, len);
+  txq->len = len;
+  txq->timestamp = *now;
+  txq->next = NULL;
+  // set txq to next of tail entry
+  if (cb->txq.head == NULL) {
+    cb->txq.head = txq;
+  } else {
+    cb->txq.tail->next = txq;
+  }
+  // update tail entry
+  cb->txq.tail = txq;
+
+  return 0;
+}
+
+static void tcp_txq_clear_all(struct tcp_cb *cb) {
+  struct tcp_txq_entry *txq = cb->txq.head, *next;
+  while (txq) {
+    next = txq->next;
+    free(txq->segment);
+    free(txq);
+    txq = next;
+  }
+  cb->txq.head = cb->txq.tail = NULL;
 }
 
 /*
@@ -217,10 +278,10 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
     case TCP_CB_STATE_CLOSED:
       if (!TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
-          tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, NULL, 0);
+          tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, &now, NULL, 0);
         } else {
           tcp_tx(cb, 0, ntoh32(hdr->seq) + plen, TCP_FLG_RST | TCP_FLG_ACK,
-                 NULL, 0);
+                 &now, NULL, 0);
         }
       }
       return;
@@ -234,7 +295,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
 
       // second check for an ACK
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
-        tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, NULL, 0);
+        tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, &now, NULL, 0);
         goto ERROR_RX_LISTEN;
       }
 
@@ -249,7 +310,8 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         cb->rcv.nxt = ntoh32(hdr->seq) + 1;
         cb->irs = ntoh32(hdr->seq);
         cb->iss = (uint32_t)random();
-        tcp_tx(cb, cb->iss, cb->rcv.nxt, TCP_FLG_SYN | TCP_FLG_ACK, NULL, 0);
+        tcp_tx(cb, cb->iss, cb->rcv.nxt, TCP_FLG_SYN | TCP_FLG_ACK, &now, NULL,
+               0);
         cb->snd.nxt = cb->iss + 1;
         cb->snd.una = cb->iss;
         cb->timeout = now.tv_sec + USER_TIMEOUT;
@@ -272,7 +334,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       // first check the ACK bit
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
         if (ntoh32(hdr->ack) <= cb->iss || ntoh32(hdr->ack) > cb->snd.nxt) {
-          tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, NULL, 0);
+          tcp_tx(cb, ntoh32(hdr->ack), 0, TCP_FLG_RST, &now, NULL, 0);
           return;
         }
         if (cb->snd.una <= ntoh32(hdr->ack) &&
@@ -314,7 +376,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         if (cb->snd.una > cb->iss) {
           // our SYN has been ACKed
           cb->state = TCP_CB_STATE_ESTABLISHED;
-          tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+          tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, &now, NULL, 0);
           pthread_cond_signal(&cb->cond);
           if (plen > 0 || TCP_FLG_ISSET(hdr->flg, TCP_FLG_URG)) {
             goto CHECK_URG;
@@ -322,7 +384,8 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
           return;
         } else {
           cb->state = TCP_CB_STATE_SYN_RCVD;
-          tcp_tx(cb, cb->iss, cb->rcv.nxt, TCP_FLG_SYN | TCP_FLG_ACK, NULL, 0);
+          tcp_tx(cb, cb->iss, cb->rcv.nxt, TCP_FLG_SYN | TCP_FLG_ACK, &now,
+                 NULL, 0);
           pthread_cond_signal(&cb->cond);
           // TODO: If there are other controls or text in the segment, queue
           // them for processing after the ESTABLISHED state has been reached,
@@ -375,7 +438,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
   if (!acceptable) {
     if (!TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
       fprintf(stderr, "is not acceptable !!!\n");
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, &now, NULL, 0);
     }
     // drop segment
     return;
@@ -419,7 +482,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
 
   // fourth, check the SYN bit
   if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_SYN)) {
-    tcp_tx(cb, 0, cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
+    tcp_tx(cb, 0, cb->rcv.nxt, TCP_FLG_RST, &now, NULL, 0);
     TCP_CLOSE_CB(cb);
     pthread_cond_broadcast(&cb->cond);
     return;
@@ -444,7 +507,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
             pthread_cond_signal(&cb->cond);
           }
         } else {
-          tcp_tx(cb, ntoh32(hdr->ack), cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
+          tcp_tx(cb, ntoh32(hdr->ack), cb->rcv.nxt, TCP_FLG_RST, &now, NULL, 0);
         }
         break;
 
@@ -470,7 +533,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
           }
         } else if (ntoh32(hdr->ack) > cb->snd.nxt) {
           fprintf(stderr, "recv ack but ack is advanced to snd.nxt\n");
-          tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+          tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, &now, NULL, 0);
           // drop the segment
           return;
         }
@@ -545,10 +608,10 @@ CHECK_URG:
                (uint8_t *)hdr + hlen, plen);
         cb->rcv.nxt = ntoh32(hdr->seq) + plen;
         cb->rcv.wnd -= plen;
-        tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+        tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, &now, NULL, 0);
         pthread_cond_broadcast(&cb->cond);
       } else if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_PSH)) {
-        tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+        tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, &now, NULL, 0);
         pthread_cond_broadcast(&cb->cond);
       }
       break;
@@ -568,7 +631,7 @@ CHECK_URG:
   // eighth, check the FIN bit
   if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_FIN)) {
     cb->rcv.nxt = ntoh32(hdr->seq) + 1;
-    tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+    tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, &now, NULL, 0);
     switch (cb->state) {
       case TCP_CB_STATE_SYN_RCVD:
       case TCP_CB_STATE_ESTABLISHED:
@@ -608,8 +671,10 @@ CHECK_URG:
  * TCP APPLICATION CONTROLLER
  */
 
+// TODO: where to get current time.
 static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
-                      uint8_t flg, uint8_t *buf, size_t len) {
+                      uint8_t flg, struct timeval *now, uint8_t *buf,
+                      size_t len) {
   uint8_t segment[1500];
   struct tcp_hdr *hdr;
   ip_addr_t self, peer;
@@ -642,6 +707,10 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
   fprintf(stderr, ">>> tcp_tx <<<\n");
   tcp_dump(cb, hdr, len);
 #endif
+
+  if (tcp_txq_add(cb, hdr, now, sizeof(struct tcp_hdr) + len) == -1) {
+    return -1;
+  }
 
   if (ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)hdr,
             sizeof(struct tcp_hdr) + len, &peer) == -1) {
@@ -745,6 +814,7 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
 static void *tcp_timer_thread(void *arg) {
   struct timeval timestamp;
   struct tcp_cb *cb;
+  struct tcp_txq_entry *txq, *prev, *tmp;
   int i;
 
   while (1) {
@@ -752,13 +822,67 @@ static void *tcp_timer_thread(void *arg) {
     pthread_mutex_lock(&mutex);
     for (i = 0; i < TCP_CB_TABLE_SIZE; i++) {
       cb = &cb_table[i];
-      if (cb->snd.una == cb->snd.nxt && cb->state != TCP_CB_STATE_TIME_WAIT) {
-        continue;
-      }
-      if (cb->timeout < timestamp.tv_sec) {
+
+      // check user timeout
+      if ((cb->snd.una != cb->snd.nxt || cb->state == TCP_CB_STATE_TIME_WAIT) &&
+          cb->timeout < timestamp.tv_sec) {
         // force close connection because of ack timeout or TIME_WAIT timeout
+
+#ifdef TCP_DEBUG
+        fprintf(stderr, ">>> find user timeout (%ld - %ld) <<<\n",
+                timestamp.tv_sec, cb->timeout);
+        tcp_state_dump(cb);
+#endif
         TCP_CLOSE_CB(cb);
         pthread_cond_broadcast(&cb->cond);
+        continue;
+      }
+
+      // check retransmission timeout and vacuum acked segment entry
+      prev = NULL;
+      txq = cb->txq.head;
+      while (txq) {
+        if (ntoh32(txq->segment->seq) >= cb->snd.una) {
+          if (timestamp.tv_sec - txq->timestamp.tv_sec > 3) {
+            // if retransmission timeout (3 seconds) then resend
+
+#ifdef TCP_DEBUG
+            fprintf(stderr, ">>> find retransmission timeout (%ld - %ld) <<<\n",
+                    timestamp.tv_sec, txq->timestamp.tv_sec);
+            tcp_dump(cb, txq->segment,
+                     txq->len - ((txq->segment->off >> 4) << 2));
+#endif
+
+            ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)txq->segment, txq->len,
+                  &cb->peer.addr);
+            txq->timestamp = timestamp;
+          }
+
+          // update previous tcp_txq_entry
+          prev = txq;
+          txq = txq->next;
+        } else {
+          // remove tcp_txq_entry from list
+
+          // swap tail tcp_txq_entry
+          if (!txq->next) {
+            // txq is tail entry
+            cb->txq.tail = prev;
+          }
+          // swap previous tcp_txq_entry
+          if (prev) {
+            prev->next = txq->next;
+          } else {
+            cb->txq.head = txq->next;
+          }
+
+          // free tcp_txq_entry
+          tmp = txq->next;
+          free(txq->segment);
+          free(txq);
+          // check next entry
+          txq = tmp;
+        }
       }
     }
     pthread_mutex_unlock(&mutex);
@@ -796,12 +920,16 @@ int tcp_api_open(void) {
 int tcp_close(struct tcp_cb *cb) {
   struct tcp_cb *backlog = NULL;
   size_t size;
+  struct timeval now;
   if (!cb->used) {
     fprintf(stderr, "error:  connection illegal for this process\n");
     return -1;
   }
 
   cb->used = 0;
+  if (gettimeofday(&now, NULL) == -1) {
+    return -1;
+  }
 
   switch (cb->state) {
     case TCP_CB_STATE_CLOSED:
@@ -820,7 +948,8 @@ int tcp_close(struct tcp_cb *cb) {
 
     case TCP_CB_STATE_SYN_RCVD:
       // if send buffer is empty
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, NULL, 0);
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, &now,
+             NULL, 0);
       cb->snd.nxt++;
       cb->state = TCP_CB_STATE_FIN_WAIT1;
       // TODO: else then wait change to ESTABLISHED state
@@ -830,7 +959,8 @@ int tcp_close(struct tcp_cb *cb) {
       // if send buffer is empty
       // TODO: else then wait send all data in send buffer
       // TODO: ? linux tcp need ack with fin ?
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, NULL, 0);
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, &now,
+             NULL, 0);
       cb->snd.nxt++;
       cb->state = TCP_CB_STATE_FIN_WAIT1;
       break;
@@ -846,7 +976,8 @@ int tcp_close(struct tcp_cb *cb) {
 
     case TCP_CB_STATE_CLOSE_WAIT:
       // wait send all data in send buffer
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, NULL, 0);
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, &now,
+             NULL, 0);
       cb->snd.nxt++;
       cb->state = TCP_CB_STATE_CLOSING;
       break;
@@ -932,7 +1063,7 @@ int tcp_api_connect(int soc, ip_addr_t *addr, uint16_t port) {
   cb->iss = (uint32_t)random();
 
   // send SYN packet
-  if (tcp_tx(cb, cb->iss, 0, TCP_FLG_SYN, NULL, 0) == -1) {
+  if (tcp_tx(cb, cb->iss, 0, TCP_FLG_SYN, &now, NULL, 0) == -1) {
     pthread_mutex_unlock(&mutex);
     return -1;
   }
@@ -1150,7 +1281,8 @@ ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len) {
         len = 1500 - 60;
       }
       // TODO: send in sending thread
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_PSH | TCP_FLG_ACK, buf, len);
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_PSH | TCP_FLG_ACK, &now, buf,
+             len);
       cb->timeout = now.tv_sec + USER_TIMEOUT;
       cb->snd.nxt += len;
       pthread_mutex_unlock(&mutex);
