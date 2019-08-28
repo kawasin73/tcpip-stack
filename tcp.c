@@ -436,6 +436,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
             cb->snd.wl2 = ntoh32(hdr->ack);
           }
         } else if (ntoh32(hdr->ack) > cb->snd.nxt) {
+          fprintf(stderr, "recv ack but ack is advanced to snd.nxt\n");
           tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
           // drop the segment
           return;
@@ -960,7 +961,76 @@ int tcp_api_accept(int soc) {
 
   return array_offset(cb_table, backlog);
 }
-ssize_t tcp_api_recv(int soc, uint8_t *buf, size_t size);
+
+ssize_t tcp_api_recv(int soc, uint8_t *buf, size_t size) {
+  struct tcp_cb *cb;
+  size_t total, len;
+  char *err;
+
+  // validate soc id
+  if (TCP_SOCKET_INVALID(soc)) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&mutex);
+  cb = &cb_table[soc];
+  if (!cb->used) {
+    pthread_mutex_unlock(&mutex);
+    return -1;
+  }
+
+TCP_RECEIVE_RETRY:
+  switch (cb->state) {
+    case TCP_CB_STATE_CLOSED:
+      err = "error:  connection illegal for this process\n";
+      goto ERROR_RECEIVE;
+
+    case TCP_CB_STATE_LISTEN:
+    case TCP_CB_STATE_SYN_SENT:
+    case TCP_CB_STATE_SYN_RCVD:
+      // TODO: wait change to ESTABLISHED
+      err = "error:  connection illegal for this process\n";
+      goto ERROR_RECEIVE;
+
+    case TCP_CB_STATE_CLOSE_WAIT:
+    case TCP_CB_STATE_ESTABLISHED:
+    case TCP_CB_STATE_FIN_WAIT1:
+    case TCP_CB_STATE_FIN_WAIT2:
+      total = sizeof(cb->window) - cb->rcv.wnd;
+      if (total == 0) {
+        if (cb->state == TCP_CB_STATE_CLOSE_WAIT) {
+          err = "error:  connection closing\n";
+          goto ERROR_RECEIVE;
+        }
+
+        // wait and retry to read rcv buffer
+        pthread_cond_wait(&cb->cond, &mutex);
+        goto TCP_RECEIVE_RETRY;
+      }
+      len = total > size ? size : total;
+      memcpy(buf, cb->window, len);
+      memmove(cb->window, cb->window + len, total - len);
+      cb->rcv.wnd += len;
+      pthread_mutex_unlock(&mutex);
+      return len;
+
+    case TCP_CB_STATE_CLOSING:
+    case TCP_CB_STATE_TIME_WAIT:
+    case TCP_CB_STATE_LAST_ACK:
+      err = "error:  connection closing\n";
+      goto ERROR_RECEIVE;
+
+    default:
+      pthread_mutex_unlock(&mutex);
+      return -1;
+  }
+
+ERROR_RECEIVE:
+  pthread_mutex_unlock(&mutex);
+  fprintf(stderr, err);
+  return -1;
+}
+
 ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len);
 
 int tcp_init(void) {

@@ -7,6 +7,7 @@
 #include "net.h"
 #include "raw.h"
 #include "tcp.h"
+#include "util.h"
 
 static int setup(void) {
   if (ethernet_init() == -1) {
@@ -32,6 +33,8 @@ int main(int argc, char const *argv[]) {
   struct netif *netif;
   char *name = "tap2", *ipaddr = "192.168.33.13", *netmask = "255.255.0.0";
   int soc, listener;
+  uint8_t buf[1024];
+  size_t n;
 
   // sigemptyset(&sigset);
   // sigaddset(&sigset, SIGINT);
@@ -81,6 +84,16 @@ int main(int argc, char const *argv[]) {
       return -1;
     }
     fprintf(stderr, "tcp_api_accept success: soc : %d\n", soc);
+
+    n = tcp_api_recv(soc, buf, 1024);
+    if (n == -1) {
+      fprintf(stderr, "tcp_api_recv: failed\n");
+    } else if (n == 0) {
+      fprintf(stderr, "tcp_api_recv: size is 0\n");
+    } else {
+      fprintf(stderr, ">>> recv data <<<\n");
+      hexdump(stderr, buf, n);
+    }
 
     if (tcp_api_close(soc) == -1) {
       fprintf(stderr, "tcp_api_close: failed\n");
