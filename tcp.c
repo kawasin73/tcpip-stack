@@ -734,8 +734,11 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
   tcp_dump(cb, hdr, len);
 #endif
 
-  if (tcp_txq_add(cb, hdr, now, sizeof(struct tcp_hdr) + len) == -1) {
-    return -1;
+  if (len > 0 || flg & (TCP_FLG_SYN | TCP_FLG_FIN)) {
+    // add txq list only packets which have ack reply
+    if (tcp_txq_add(cb, hdr, now, sizeof(struct tcp_hdr) + len) == -1) {
+      return -1;
+    }
   }
 
   if (ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)hdr,
