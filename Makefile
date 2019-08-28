@@ -1,7 +1,7 @@
 TEST = test/raw_test test/ethernet_test test/ip_test test/mask_test \
 	test/tcp_test test/tcp_listen_test test/queue_test
 OBJS = raw.o util.o ethernet.o net.o ip.o arp.o tcp.o
-CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I . -DDEBUG -g
+CFLAGS := $(CFLAGS) -g -W -Wall -Wno-unused-parameter -I . -DTCP_DEBUG -g
 
 ifeq ($(shell uname), Linux)
 	OBJS := $(OBJS) raw/soc.o raw/tap_linux.o

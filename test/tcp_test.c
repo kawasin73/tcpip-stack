@@ -86,6 +86,12 @@ int main(int argc, char const *argv[]) {
       break;
     }
   }
+
+  if (tcp_api_close(soc) == -1) {
+    fprintf(stderr, "tcp_api_close: failed\n");
+    return -1;
+  }
+
   if (dev->ops->close) {
     dev->ops->close(dev);
   }

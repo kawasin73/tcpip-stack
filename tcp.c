@@ -32,6 +32,8 @@
 #define TCP_FLG_IS(x, y) (((x)&0x3f) == (y))
 #define TCP_FLG_ISSET(x, y) (((x)&0x3f) & (y))
 
+#define IS_FREE_CB(cb) (!(cb)->used && (cb)->state == TCP_CB_STATE_CLOSED)
+
 #ifndef TCP_DEBUG
 #ifdef DEBUG
 #define TCP_DEBUG 1
@@ -146,6 +148,7 @@ static char *tcp_state_ntop(uint8_t state) {
 static void tcp_state_dump(struct tcp_cb *cb) {
   char buf[64];
 
+  fprintf(stderr, "      used: %d\n", cb->used);
   fprintf(stderr, "     state: %s\n", tcp_state_ntop(cb->state));
   fprintf(stderr, " self.port: %u\n", ntoh16(cb->port));
   fprintf(stderr, " peer.addr: %s\n", ip_addr_ntop(&cb->peer.addr, buf, 64));
@@ -157,10 +160,11 @@ static void tcp_state_dump(struct tcp_cb *cb) {
   fprintf(stderr, " n_backlog: %u\n", cb->backlog.num);
 }
 
-static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr) {
+static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr, size_t plen) {
   char buf[64];
 
   tcp_state_dump(cb);
+  fprintf(stderr, " len: %u\n", plen);
   fprintf(stderr, " src: %u\n", ntoh16(hdr->src));
   fprintf(stderr, " dst: %u\n", ntoh16(hdr->dst));
   fprintf(stderr, " seq: %u\n", ntoh32(hdr->seq));
@@ -203,13 +207,13 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       // first check for an RST
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         // incoming RST is ignored
-        return;
+        goto ERROR_RX_LISTEN;
       }
 
       // second check for an ACK
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
         tcp_tx(cb, hdr->ack, 0, TCP_FLG_RST, NULL, 0);
-        return;
+        goto ERROR_RX_LISTEN;
       }
 
       // third check for a SYN
@@ -226,7 +230,6 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         tcp_tx(cb, cb->iss, cb->rcv.nxt, TCP_FLG_SYN | TCP_FLG_ACK, NULL, 0);
         cb->snd.nxt = cb->iss + 1;
         cb->snd.una = cb->iss;
-        cb->used = 1;
         cb->state = TCP_CB_STATE_SYN_RCVD;
 
         // TODO: ?  queue to backlog ?
@@ -234,6 +237,10 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       }
 
       // no packet should come here. drop segment
+    ERROR_RX_LISTEN:
+      // return state to CLOSED
+      cb->state = TCP_CB_STATE_CLOSED;
+      cb->parent = NULL;
       return;
 
     case TCP_CB_STATE_SYN_SENT:
@@ -261,7 +268,6 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         sprintf(stderr, "error: connection reset\n");
         cb->state = TCP_CB_STATE_CLOSED;
         // TODO: delete cb
-        cb->used = 0;
         pthread_cond_signal(&cb->cond);
         return;
       }
@@ -350,7 +356,6 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
     case TCP_CB_STATE_SYN_RCVD:
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         // close connection
-        cb->used = 0;
         cb->state = TCP_CB_STATE_CLOSED;
         pthread_cond_signal(&cb->cond);
         return;
@@ -364,7 +369,6 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         // TODO: signal to SEND, RECEIVE waiting thread.
         // TODO: ? use reference count for used ?
-        cb->used = 0;
         cb->state = TCP_CB_STATE_CLOSED;
         return;
       }
@@ -374,7 +378,6 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
     case TCP_CB_STATE_LAST_ACK:
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         // close connection
-        cb->used = 0;
         cb->state = TCP_CB_STATE_CLOSED;
         return;
       }
@@ -387,7 +390,6 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
   if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_SYN)) {
     // TODO: signal
     tcp_tx(cb, 0, cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
-    cb->used = 0;
     cb->state = TCP_CB_STATE_CLOSED;
     return;
   }
@@ -401,9 +403,15 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         if (cb->snd.una <= ntoh32(hdr->ack) &&
             ntoh32(hdr->ack) <= cb->snd.nxt) {
           cb->state = TCP_CB_STATE_ESTABLISHED;
-          // add cb to backlog
-          queue_push(&cb->parent->backlog, cb, sizeof(*cb));
-          pthread_cond_signal(&cb->parent->cond);
+          if (cb->parent) {
+            // add cb to backlog
+            queue_push(&cb->parent->backlog, cb, sizeof(*cb));
+            pthread_cond_signal(&cb->parent->cond);
+          } else {
+            // parent == NULL means cb is created by user and first state was
+            // SYN_SENT
+            pthread_cond_signal(&cb->cond);
+          }
         } else {
           tcp_tx(cb, hdr->ack, cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
         }
@@ -453,7 +461,6 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         // if this ACK is for sent FIN
         if (ntoh32(hdr->ack) == cb->snd.nxt) {
           cb->state = TCP_CB_STATE_CLOSED;
-          cb->used = 0;
           return;
         }
         break;
@@ -585,9 +592,9 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
   pseudo += hton16(sizeof(struct tcp_hdr) + len);
   hdr->sum = cksum16((uint16_t *)hdr, sizeof(struct tcp_hdr) + len, pseudo);
 
-#ifdef DEBUG
+#ifdef TCP_DEBUG
   fprintf(stderr, ">>> tcp_tx <<<\n");
-  tcp_dump(cb, hdr);
+  tcp_dump(cb, hdr, len);
 #endif
 
   if (ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)hdr,
@@ -633,7 +640,7 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
   // find connection cb or listener cb
   for (i = 0; i < TCP_CB_TABLE_SIZE; i++) {
     cb = &cb_table[i];
-    if (!cb->used) {
+    if (IS_FREE_CB(cb)) {
       // cache cb for the case SYN message and no cb is connected to this peer
       if (fcb == NULL) {
         fcb = cb;
@@ -679,9 +686,9 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
   }
   // else cb that matches this tcp packet is found.
 
-#ifdef DEBUG
+#ifdef TCP_DEBUG
   fprintf(stderr, ">>> tcp_rx <<<\n");
-  tcp_dump(cb, hdr);
+  tcp_dump(cb, hdr, len - sizeof(struct tcp_hdr));
 #endif
 
   // handle message
@@ -701,9 +708,8 @@ int tcp_api_open(void) {
   pthread_mutex_lock(&mutex);
   for (i = 0; i < TCP_CB_TABLE_SIZE; i++) {
     cb = &cb_table[i];
-    if (!cb->used) {
+    if (IS_FREE_CB(cb)) {
       cb->used = 1;
-      cb->state = TCP_CB_STATE_CLOSED;
       pthread_mutex_unlock(&mutex);
       return i;
     }
@@ -713,8 +719,80 @@ int tcp_api_open(void) {
   return -1;
 }
 
+int tcp_close(struct tcp_cb *cb) {
+  struct tcp_cb *backlog = NULL;
+  size_t size;
+  if (!cb->used) {
+    fprintf(stderr, "error:  connection illegal for this process\n");
+    return -1;
+  }
+
+  cb->used = 0;
+
+  switch (cb->state) {
+    case TCP_CB_STATE_CLOSED:
+      break;
+
+    case TCP_CB_STATE_LISTEN:
+      // close all cb in backlog
+      while (queue_pop(&cb->backlog, &backlog, &size) != -1) {
+        tcp_close(backlog);
+      }
+    case TCP_CB_STATE_SYN_SENT:
+      // close socket
+      cb->state = TCP_CB_STATE_CLOSED;
+      pthread_cond_broadcast(&cb->cond);
+      break;
+
+    case TCP_CB_STATE_SYN_RCVD:
+      // if send buffer is empty
+      cb->snd.nxt++;
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN, NULL, 0);
+      cb->state = TCP_CB_STATE_FIN_WAIT1;
+      // TODO: else then wait change to ESTABLISHED state
+      break;
+
+    case TCP_CB_STATE_ESTABLISHED:
+      // if send buffer is empty
+      // TODO: else then wait send all data in send buffer
+      cb->snd.nxt++;
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, NULL, 0);
+      cb->state = TCP_CB_STATE_FIN_WAIT1;
+      break;
+
+    case TCP_CB_STATE_FIN_WAIT1:
+    case TCP_CB_STATE_FIN_WAIT2:
+    // "ok" response would be acceptable
+    case TCP_CB_STATE_CLOSING:
+    case TCP_CB_STATE_TIME_WAIT:
+    case TCP_CB_STATE_LAST_ACK:
+      fprintf(stderr, "error:  connection closing\n");
+      return -1;
+
+    case TCP_CB_STATE_CLOSE_WAIT:
+      // wait send all data in send buffer
+      cb->snd.nxt++;
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN, NULL, 0);
+      cb->state = TCP_CB_STATE_CLOSING;
+      break;
+  }
+
+  return 0;
+}
+
 int tcp_api_close(int soc) {
-  // TODO: close
+  int ret;
+
+  // validate soc id
+  if (TCP_SOCKET_INVALID(soc)) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&mutex);
+  ret = tcp_close(&cb_table[soc]);
+  pthread_mutex_unlock(&mutex);
+
+  return ret;
 }
 
 int tcp_api_connect(int soc, ip_addr_t *addr, uint16_t port) {
@@ -744,7 +822,7 @@ int tcp_api_connect(int soc, ip_addr_t *addr, uint16_t port) {
     for (i = TCP_SOURCE_PORT_MIN + offset; i <= TCP_SOURCE_PORT_MAX; i++) {
       for (j = 0; j < TCP_CB_TABLE_SIZE; j++) {
         tmp = &cb_table[j];
-        if (tmp->used && tmp->port == hton16((uint16_t)i)) {
+        if (!IS_FREE_CB(tmp) && tmp->port == hton16((uint16_t)i)) {
           break;
         }
       }
@@ -864,10 +942,14 @@ int tcp_api_accept(int soc) {
     pthread_cond_wait(&cb->cond, &mutex);
   }
 
-  pthread_mutex_unlock(&mutex);
   if (!backlog) {
+    pthread_mutex_unlock(&mutex);
     return -1;
   }
+
+  backlog->used = 1;
+  pthread_mutex_unlock(&mutex);
+
   return array_offset(cb_table, backlog);
 }
 ssize_t tcp_api_recv(int soc, uint8_t *buf, size_t size);

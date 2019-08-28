@@ -80,12 +80,24 @@ int main(int argc, char const *argv[]) {
       fprintf(stderr, "tcp_api_accept: failed\n");
       return -1;
     }
-    fprintf(stderr, "tcp_api_accept success\n");
+    fprintf(stderr, "tcp_api_accept success: soc : %d\n", soc);
+
+    if (tcp_api_close(soc) == -1) {
+      fprintf(stderr, "tcp_api_close: failed\n");
+    } else {
+      fprintf(stderr, "tcp_api_close: success\n");
+    }
     // sigwait(&sigset, &signo);
     // if (signo == SIGINT) {
     //   break;
     // }
   }
+
+  if (tcp_api_close(listener) == -1) {
+    fprintf(stderr, "tcp_api_close: failed\n");
+    return -1;
+  }
+
   if (dev->ops->close) {
     dev->ops->close(dev);
   }
