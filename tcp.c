@@ -233,7 +233,8 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
         cb->state = TCP_CB_STATE_SYN_RCVD;
 
         // TODO: ?  queue to backlog ?
-        break;
+        // TODO: increment hdr->seq for save text
+        goto CHECK_URG;
       }
 
       // no packet should come here. drop segment
@@ -345,6 +346,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
 
   if (!acceptable) {
     if (!TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
+      fprintf(stderr, "is not acceptable !!!\n");
       tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
     }
     // drop segment
@@ -501,13 +503,19 @@ CHECK_URG:
     case TCP_CB_STATE_ESTABLISHED:
     case TCP_CB_STATE_FIN_WAIT1:
     case TCP_CB_STATE_FIN_WAIT2:
-      // copy segment to receive buffer
-      memcpy(cb->window + (sizeof(cb->window) - cb->rcv.wnd),
-             (uint8_t *)hdr + hlen, plen);
-      cb->rcv.nxt = ntoh32(hdr->seq) + plen;
-      cb->rcv.wnd -= plen;
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
-      pthread_cond_signal(&cb->cond);
+      // TODO: accept not ordered packet
+      if (plen > 0 && cb->rcv.nxt == hdr->seq) {
+        // copy segment to receive buffer
+        memcpy(cb->window + (sizeof(cb->window) - cb->rcv.wnd),
+               (uint8_t *)hdr + hlen, plen);
+        cb->rcv.nxt = ntoh32(hdr->seq) + plen;
+        cb->rcv.wnd -= plen;
+        tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+        pthread_cond_signal(&cb->cond);
+      } else if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_PSH)) {
+        tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
+        pthread_cond_signal(&cb->cond);
+      }
       break;
 
     case TCP_CB_STATE_CLOSING:
@@ -688,7 +696,7 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
 
 #ifdef TCP_DEBUG
   fprintf(stderr, ">>> tcp_rx <<<\n");
-  tcp_dump(cb, hdr, len - sizeof(struct tcp_hdr));
+  tcp_dump(cb, hdr, len - ((hdr->off >> 4) << 2));
 #endif
 
   // handle message
@@ -746,8 +754,8 @@ int tcp_close(struct tcp_cb *cb) {
 
     case TCP_CB_STATE_SYN_RCVD:
       // if send buffer is empty
-      cb->snd.nxt++;
       tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN, NULL, 0);
+      cb->snd.nxt++;
       cb->state = TCP_CB_STATE_FIN_WAIT1;
       // TODO: else then wait change to ESTABLISHED state
       break;
@@ -755,8 +763,9 @@ int tcp_close(struct tcp_cb *cb) {
     case TCP_CB_STATE_ESTABLISHED:
       // if send buffer is empty
       // TODO: else then wait send all data in send buffer
-      cb->snd.nxt++;
+      // TODO: ? linux tcp need ack with fin ?
       tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, NULL, 0);
+      cb->snd.nxt++;
       cb->state = TCP_CB_STATE_FIN_WAIT1;
       break;
 
@@ -771,8 +780,8 @@ int tcp_close(struct tcp_cb *cb) {
 
     case TCP_CB_STATE_CLOSE_WAIT:
       // wait send all data in send buffer
-      cb->snd.nxt++;
       tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN, NULL, 0);
+      cb->snd.nxt++;
       cb->state = TCP_CB_STATE_CLOSING;
       break;
   }
