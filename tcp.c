@@ -35,6 +35,21 @@
 
 #define IS_FREE_CB(cb) (!(cb)->used && (cb)->state == TCP_CB_STATE_CLOSED)
 
+#define TCP_SOCKET_INVALID(x) ((x) < 0 || (x) >= TCP_CB_TABLE_SIZE)
+
+// http://macro.gjpw.net/c%E8%A8%80%E8%AA%9E%E3%83%9E%E3%82%AF%E3%83%AD%E3%81%AE%E4%BE%8B/member_size%20%E6%A7%8B%E9%80%A0%E4%BD%93%E3%83%A1%E3%83%B3%E3%83%90%E3%81%AE%E3%82%B5%E3%82%A4%E3%82%BA%E5%8F%96%E5%BE%97
+#define MEMBER_SIZE(type, member) (sizeof(((type *)0)->member))
+#define TCP_CLOSE_CB(cb)                                    \
+  do {                                                      \
+    (cb)->state = TCP_CB_STATE_CLOSED;                      \
+    memset(&(cb)->snd, 0, MEMBER_SIZE(struct tcp_cb, snd)); \
+    (cb)->iss = 0;                                          \
+    memset(&(cb)->rcv, 0, MEMBER_SIZE(struct tcp_cb, rcv)); \
+    (cb)->irs = 0;                                          \
+  } while (0)
+
+#define USER_TIMEOUT (60 * 1000)
+
 #ifndef TCP_DEBUG
 #ifdef DEBUG
 #define TCP_DEBUG 1
@@ -82,8 +97,6 @@ struct tcp_cb {
   struct queue_head backlog;
   pthread_cond_t cond;
 };
-
-#define TCP_SOCKET_INVALID(x) ((x) < 0 || (x) >= TCP_CB_TABLE_SIZE)
 
 static struct tcp_cb cb_table[TCP_CB_TABLE_SIZE];
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -240,7 +253,8 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       // no packet should come here. drop segment
     ERROR_RX_LISTEN:
       // return state to CLOSED
-      cb->state = TCP_CB_STATE_CLOSED;
+      TCP_CLOSE_CB(cb);
+      pthread_cond_broadcast(&cb->cond);
       cb->parent = NULL;
       return;
 
@@ -267,8 +281,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
           return;
         }
         fprintf(stderr, "error: connection reset\n");
-        cb->state = TCP_CB_STATE_CLOSED;
-        // TODO: delete cb
+        TCP_CLOSE_CB(cb);
         pthread_cond_signal(&cb->cond);
         return;
       }
@@ -358,7 +371,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
     case TCP_CB_STATE_SYN_RCVD:
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         // close connection
-        cb->state = TCP_CB_STATE_CLOSED;
+        TCP_CLOSE_CB(cb);
         pthread_cond_signal(&cb->cond);
         return;
       }
@@ -370,8 +383,8 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
     case TCP_CB_STATE_CLOSE_WAIT:
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         // TODO: signal to SEND, RECEIVE waiting thread.
-        // TODO: ? use reference count for used ?
-        cb->state = TCP_CB_STATE_CLOSED;
+        TCP_CLOSE_CB(cb);
+        pthread_cond_broadcast(&cb->cond);
         return;
       }
       break;
@@ -380,7 +393,8 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
     case TCP_CB_STATE_LAST_ACK:
       if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_RST)) {
         // close connection
-        cb->state = TCP_CB_STATE_CLOSED;
+        TCP_CLOSE_CB(cb);
+        pthread_cond_broadcast(&cb->cond);
         return;
       }
       break;
@@ -390,9 +404,9 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
 
   // fourth, check the SYN bit
   if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_SYN)) {
-    // TODO: signal
     tcp_tx(cb, 0, cb->rcv.nxt, TCP_FLG_RST, NULL, 0);
-    cb->state = TCP_CB_STATE_CLOSED;
+    TCP_CLOSE_CB(cb);
+    pthread_cond_broadcast(&cb->cond);
     return;
   }
   // TODO: ? If the SYN is not in the window this step would not be reached and
@@ -463,7 +477,8 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
       case TCP_CB_STATE_LAST_ACK:
         // if this ACK is for sent FIN
         if (ntoh32(hdr->ack) == cb->snd.nxt) {
-          cb->state = TCP_CB_STATE_CLOSED;
+          TCP_CLOSE_CB(cb);
+          pthread_cond_broadcast(&cb->cond);
           return;
         }
         break;
@@ -533,7 +548,6 @@ CHECK_URG:
 
   // eighth, check the FIN bit
   if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_FIN)) {
-    // TODO: signal "connection closing"
     cb->rcv.nxt = ntoh32(hdr->seq) + 1;
     tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, NULL, 0);
     switch (cb->state) {
@@ -563,6 +577,8 @@ CHECK_URG:
         // TODO: restart the 2MSL timeout
         break;
     }
+    // signal "connection closing"
+    pthread_cond_broadcast(&cb->cond);
   }
   return;
 }
@@ -687,7 +703,6 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
     } else {
       // this port is not listened.
       // this packet is invalid. no connection is found.
-      cb->state = TCP_CB_STATE_CLOSED;
       cb->port = 0;
     }
     cb->peer.addr = *src;
@@ -749,13 +764,13 @@ int tcp_close(struct tcp_cb *cb) {
       }
     case TCP_CB_STATE_SYN_SENT:
       // close socket
-      cb->state = TCP_CB_STATE_CLOSED;
+      TCP_CLOSE_CB(cb);
       pthread_cond_broadcast(&cb->cond);
       break;
 
     case TCP_CB_STATE_SYN_RCVD:
       // if send buffer is empty
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN, NULL, 0);
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, NULL, 0);
       cb->snd.nxt++;
       cb->state = TCP_CB_STATE_FIN_WAIT1;
       // TODO: else then wait change to ESTABLISHED state
@@ -781,7 +796,7 @@ int tcp_close(struct tcp_cb *cb) {
 
     case TCP_CB_STATE_CLOSE_WAIT:
       // wait send all data in send buffer
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN, NULL, 0);
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_FIN | TCP_FLG_ACK, NULL, 0);
       cb->snd.nxt++;
       cb->state = TCP_CB_STATE_CLOSING;
       break;
