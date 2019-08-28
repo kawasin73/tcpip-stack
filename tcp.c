@@ -1031,7 +1031,65 @@ ERROR_RECEIVE:
   return -1;
 }
 
-ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len);
+ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len) {
+  struct tcp_cb *cb;
+  char *err;
+
+  // validate soc id
+  if (TCP_SOCKET_INVALID(soc)) {
+    return -1;
+  }
+
+  pthread_mutex_lock(&mutex);
+  cb = &cb_table[soc];
+  if (!cb->used) {
+    pthread_mutex_unlock(&mutex);
+    return -1;
+  }
+
+  switch (cb->state) {
+    case TCP_CB_STATE_CLOSED:
+      err = "error:  connection illegal for this process\n";
+      goto ERROR_SEND;
+
+    case TCP_CB_STATE_LISTEN:
+      // TODO: change to active mode if foreign socket is specified
+    case TCP_CB_STATE_SYN_SENT:
+    case TCP_CB_STATE_SYN_RCVD:
+      // TODO: wait change to ESTABLISHED
+      err = "error:  connection illegal for this process\n";
+      goto ERROR_SEND;
+
+    case TCP_CB_STATE_CLOSE_WAIT:
+    case TCP_CB_STATE_ESTABLISHED:
+      if (len > 1500 - 60) {
+        len = 1500 - 60;
+      }
+      // TODO: send in sending thread
+      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_PSH | TCP_FLG_ACK, buf, len);
+      cb->snd.nxt += len;
+      pthread_mutex_unlock(&mutex);
+      // TODO: support urg pointer
+      return len;
+
+    case TCP_CB_STATE_FIN_WAIT1:
+    case TCP_CB_STATE_FIN_WAIT2:
+    case TCP_CB_STATE_CLOSING:
+    case TCP_CB_STATE_TIME_WAIT:
+    case TCP_CB_STATE_LAST_ACK:
+      err = "error:  connection closing\n";
+      goto ERROR_SEND;
+
+    default:
+      pthread_mutex_unlock(&mutex);
+      return -1;
+  }
+
+ERROR_SEND:
+  pthread_mutex_unlock(&mutex);
+  fprintf(stderr, err);
+  return -1;
+}
 
 int tcp_init(void) {
   int i;

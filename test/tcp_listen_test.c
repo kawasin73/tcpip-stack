@@ -85,6 +85,13 @@ int main(int argc, char const *argv[]) {
     }
     fprintf(stderr, "tcp_api_accept success: soc : %d\n", soc);
 
+    n = tcp_api_send(soc, "hello tcp world!\n", 17);
+    if (n == -1) {
+      fprintf(stderr, "tcp_api_send: failed\n");
+    } else {
+      fprintf(stderr, ">>> send data success <<<\n");
+    }
+
     n = tcp_api_recv(soc, buf, 1024);
     if (n == -1) {
       fprintf(stderr, "tcp_api_recv: failed\n");
