@@ -499,23 +499,25 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
   if (TCP_FLG_ISSET(hdr->flg, TCP_FLG_ACK)) {
     switch (cb->state) {
       case TCP_CB_STATE_SYN_RCVD:
-        if (cb->snd.una <= ntoh32(hdr->ack) &&
-            ntoh32(hdr->ack) <= cb->snd.nxt) {
-          cb->state = TCP_CB_STATE_ESTABLISHED;
-          if (cb->parent) {
-            // add cb to backlog
-            queue_push(&cb->parent->backlog, cb, sizeof(*cb));
-            pthread_cond_signal(&cb->parent->cond);
-          } else {
-            // parent == NULL means cb is created by user and first state was
-            // SYN_SENT
-            pthread_cond_signal(&cb->cond);
-          }
-        } else {
+        if (!(cb->snd.una <= ntoh32(hdr->ack) &&
+              ntoh32(hdr->ack) <= cb->snd.nxt)) {
+          // hdr->ack is not acceptable
           tcp_tx(cb, ntoh32(hdr->ack), cb->rcv.nxt, TCP_FLG_RST, &now, NULL, 0);
+          // The connection remains in the same state after send RST
+          break;
         }
-        break;
+        cb->state = TCP_CB_STATE_ESTABLISHED;
+        if (cb->parent) {
+          // add cb to backlog
+          queue_push(&cb->parent->backlog, cb, sizeof(*cb));
+          pthread_cond_signal(&cb->parent->cond);
+        } else {
+          // parent == NULL means cb is created by user and first state was
+          // SYN_SENT
+          pthread_cond_signal(&cb->cond);
+        }
 
+        // enter ESTABLISHED state and continue processing
       case TCP_CB_STATE_ESTABLISHED:
       case TCP_CB_STATE_FIN_WAIT1:
       case TCP_CB_STATE_FIN_WAIT2:
