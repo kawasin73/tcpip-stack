@@ -1,3 +1,4 @@
+APPS = apps/tcp_echo
 TEST = test/raw_test test/ethernet_test test/ip_test test/mask_test \
 	test/tcp_test test/tcp_listen_test test/queue_test
 OBJS = raw.o util.o ethernet.o net.o ip.o arp.o tcp.o
@@ -11,7 +12,10 @@ endif
 
 .PHONY: all clean
 
-all: $(TEST)
+all: $(TEST) $(APPS)
+
+$(APPS): % : %.o $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^
 
 $(TEST): % : %.o $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
@@ -20,4 +24,4 @@ $(TEST): % : %.o $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -rf $(TEST) $(TEST:=.o) $(OBJS)
+	rm -rf $(APPS) $(APPS:=.o) $(TEST) $(TEST:=.o) $(OBJS)

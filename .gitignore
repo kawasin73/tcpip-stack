@@ -4,3 +4,4 @@
 *.o
 
 test/*_test
+apps/tcp_echo
