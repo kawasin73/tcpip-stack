@@ -10,6 +10,7 @@
 // TODO: user timeout should set by user
 #define USER_TIMEOUT (20)          /* user timeout (seconds) */
 #define TIME_WAIT_TIMEOUT (2 * 10) /* TIME_WAIT timeout (seconds) */
+#define TCP_SND_BUF_SIZE 4096
 
 #define TCP_CB_TABLE_SIZE 128
 #define TCP_SOURCE_PORT_MIN 49152
@@ -36,6 +37,9 @@
 
 #define TCP_FLG_IS(x, y) (((x)&0x3f) == (y))
 #define TCP_FLG_ISSET(x, y) (((x)&0x3f) & (y))
+
+#define TCP_HDR_LEN(hdr) (((hdr)->off >> 4) << 2)
+#define TCP_DATA_LEN(hdr, len) ((len)-TCP_HDR_LEN(hdr))
 
 #define IS_FREE_CB(cb) (!(cb)->used && (cb)->state == TCP_CB_STATE_CLOSED)
 
@@ -69,6 +73,8 @@ struct tcp_txq_entry {
 struct tcp_txq_head {
   struct tcp_txq_entry *head;
   struct tcp_txq_entry *tail;
+  struct tcp_txq_entry *snt_tail;
+  uint16_t snt;
 };
 
 struct tcp_cb {
@@ -176,6 +182,7 @@ static void tcp_state_dump(struct tcp_cb *cb) {
   fprintf(stderr, "   snd.nxt: %u\n", cb->snd.nxt);
   fprintf(stderr, "   snd.una: %u\n", cb->snd.una);
   fprintf(stderr, "   snd.wnd: %u\n", cb->snd.wnd);
+  fprintf(stderr, "   txq.snt: %u\n", cb->txq.snt);
   fprintf(stderr, "   rcv.nxt: %u\n", cb->rcv.nxt);
   fprintf(stderr, "   rcv.wnd: %u\n", cb->rcv.wnd);
   fprintf(stderr, " n_backlog: %u\n", cb->backlog.num);
@@ -202,22 +209,18 @@ static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr, size_t plen) {
  * Segment Queue
  */
 
-static int tcp_txq_add(struct tcp_cb *cb, struct tcp_hdr *hdr,
-                       struct timeval *now, size_t len) {
+static struct tcp_txq_entry *tcp_txq_add(struct tcp_cb *cb, struct tcp_hdr *hdr,
+                                         size_t len) {
   struct tcp_txq_entry *txq;
 
   txq = malloc(sizeof(struct tcp_txq_entry));
   if (!txq) {
-    return -1;
+    return NULL;
   }
-  txq->segment = malloc(len);
-  if (!txq->segment) {
-    free(txq);
-    return -1;
-  }
-  memcpy(txq->segment, hdr, len);
+  txq->segment = hdr;
   txq->len = len;
-  txq->timestamp = *now;
+  // clear timestamp
+  memset(&txq->timestamp, 0, sizeof(txq->timestamp));
   txq->next = NULL;
   // set txq to next of tail entry
   if (cb->txq.head == NULL) {
@@ -228,7 +231,7 @@ static int tcp_txq_add(struct tcp_cb *cb, struct tcp_hdr *hdr,
   // update tail entry
   cb->txq.tail = txq;
 
-  return 0;
+  return txq;
 }
 
 static void tcp_txq_clear_all(struct tcp_cb *cb) {
@@ -261,12 +264,11 @@ static void tcp_close_cb(struct tcp_cb *cb) {
 // https://tools.ietf.org/html/rfc793#page-65
 static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
                                       size_t len) {
-  size_t hlen, plen;
+  size_t plen;
   int acceptable = 0;
   struct timeval now;
 
-  hlen = (hdr->off >> 4) << 2;
-  plen = len - hlen;
+  plen = TCP_DATA_LEN(hdr, len);
   if (gettimeofday(&now, NULL) == -1) {
     perror("gettimeofday");
     return;
@@ -531,6 +533,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
             cb->timeout = now.tv_sec + USER_TIMEOUT;
           }
           // TODO: retransmission queue send
+          pthread_cond_broadcast(&cb->cond);
 
           if ((cb->snd.wl1 < ntoh32(hdr->seq)) ||
               (cb->snd.wl1 == ntoh32(hdr->seq) &&
@@ -623,7 +626,7 @@ CHECK_URG:
       if (plen > 0 && cb->rcv.nxt == ntoh32(hdr->seq)) {
         // copy segment to receive buffer
         memcpy(cb->window + (sizeof(cb->window) - cb->rcv.wnd),
-               (uint8_t *)hdr + hlen, plen);
+               (uint8_t *)hdr + TCP_HDR_LEN(hdr), plen);
         cb->rcv.nxt = ntoh32(hdr->seq) + plen;
         cb->rcv.wnd -= plen;
         tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_ACK, &now, NULL, 0);
@@ -703,13 +706,21 @@ CHECK_URG:
 static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
                       uint8_t flg, struct timeval *now, uint8_t *buf,
                       size_t len) {
-  uint8_t segment[1500];
+  uint8_t *segment;
   struct tcp_hdr *hdr;
   ip_addr_t self, peer;
   uint32_t pseudo = 0;
+  struct tcp_txq_entry *txq = NULL;
 
-  memset(&segment, 0, sizeof(segment));
+  // allocate segment
+  segment = malloc(sizeof(struct tcp_hdr) + len);
+  if (!segment) {
+    return -1;
+  }
+
+  // set header params
   hdr = (struct tcp_hdr *)segment;
+  memset(hdr, 0, sizeof(struct tcp_hdr));
   hdr->src = cb->port;
   hdr->dst = cb->peer.port;
   hdr->seq = hton32(seq);
@@ -719,8 +730,11 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
   hdr->win = hton16(cb->rcv.wnd);
   hdr->sum = 0;
   hdr->urg = 0;
-  // TODO: check buffer len is smaller than segment size
+
+  // copy data
   memcpy(hdr + 1, buf, len);
+
+  // calculate checksum
   self = ((struct netif_ip *)cb->iface)->unicast;
   peer = cb->peer.addr;
   pseudo += (self >> 16) & 0xffff;
@@ -738,18 +752,36 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
 
   if (len > 0 || flg & (TCP_FLG_SYN | TCP_FLG_FIN)) {
     // add txq list only packets which have ack reply
-    if (tcp_txq_add(cb, hdr, now, sizeof(struct tcp_hdr) + len) == -1) {
+    txq = tcp_txq_add(cb, hdr, sizeof(struct tcp_hdr) + len);
+    if (!txq) {
+      free(segment);
       return -1;
     }
+
+    // TODO: flow control
+    // TODO: check send window size and return
   }
 
+  // send packet
   if (ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)hdr,
             sizeof(struct tcp_hdr) + len, &peer) == -1) {
     // failed to send ip packet
+    if (!txq) {
+      // this packet does not expect reply so not queued into txq list
+      free(segment);
+    }
     return -1;
   }
 
-  // TODO: add txq
+  if (txq) {
+    // set timestamp
+    txq->timestamp = *now;
+    cb->txq.snt += len;
+  } else {
+    // this packet does not expect reply so not queued into txq list
+    free(segment);
+  }
+
   return len;
 }
 
@@ -833,7 +865,7 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
 
 #ifdef TCP_DEBUG
   fprintf(stderr, ">>> tcp_rx <<<\n");
-  tcp_dump(cb, hdr, len - ((hdr->off >> 4) << 2));
+  tcp_dump(cb, hdr, TCP_DATA_LEN(hdr, len));
 #endif
 
   // handle message
@@ -880,8 +912,7 @@ static void *tcp_timer_thread(void *arg) {
 #ifdef TCP_DEBUG
             fprintf(stderr, ">>> find retransmission timeout (%ld - %ld) <<<\n",
                     timestamp.tv_sec, txq->timestamp.tv_sec);
-            tcp_dump(cb, txq->segment,
-                     txq->len - ((txq->segment->off >> 4) << 2));
+            tcp_dump(cb, txq->segment, TCP_DATA_LEN(txq->segment, txq->len));
 #endif
 
             ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)txq->segment, txq->len,
@@ -894,6 +925,7 @@ static void *tcp_timer_thread(void *arg) {
           txq = txq->next;
         } else {
           // remove tcp_txq_entry from list
+          cb->txq.snt -= TCP_DATA_LEN(txq->segment, txq->len);
 
           // swap tail tcp_txq_entry
           if (!txq->next) {
@@ -920,8 +952,6 @@ static void *tcp_timer_thread(void *arg) {
     // sleep 100 ms
     usleep(100 * 1000);
   }
-
-  return NULL;
 
   return NULL;
 }
@@ -1270,6 +1300,8 @@ ERROR_RECEIVE:
 ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len) {
   struct tcp_cb *cb;
   struct timeval now;
+  size_t snt = 0, size;
+  uint16_t wnd;
   char *err;
 
   // validate soc id
@@ -1284,6 +1316,7 @@ ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len) {
     return -1;
   }
 
+TCP_API_SEND_NEXT:
   switch (cb->state) {
     case TCP_CB_STATE_CLOSED:
       err = "error:  connection illegal for this process\n";
@@ -1299,26 +1332,8 @@ ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len) {
 
     case TCP_CB_STATE_CLOSE_WAIT:
     case TCP_CB_STATE_ESTABLISHED:
-
-      // TODO: flow control
-
-      if (gettimeofday(&now, NULL) == -1) {
-        perror("gettimeofday");
-        pthread_mutex_unlock(&mutex);
-        return -1;
-      }
-
-      if (len > 1500 - 60) {
-        len = 1500 - 60;
-      }
-      // TODO: send in sending thread
-      tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_PSH | TCP_FLG_ACK, &now, buf,
-             len);
-      cb->timeout = now.tv_sec + USER_TIMEOUT;
-      cb->snd.nxt += len;
-      pthread_mutex_unlock(&mutex);
-      // TODO: support urg pointer
-      return len;
+      // send buf
+      break;
 
     case TCP_CB_STATE_FIN_WAIT1:
     case TCP_CB_STATE_FIN_WAIT2:
@@ -1332,6 +1347,56 @@ ssize_t tcp_api_send(int soc, uint8_t *buf, size_t len) {
       pthread_mutex_unlock(&mutex);
       return -1;
   }
+
+  if (gettimeofday(&now, NULL) == -1) {
+    perror("gettimeofday");
+    pthread_mutex_unlock(&mutex);
+    return (snt == 0) ? -1 : ((ssize_t)snt);
+  }
+
+  if (len > 0) {
+    // mtu may changes, so calc size each time
+    size = cb->iface->dev->mtu - IP_HDR_SIZE_MAX - sizeof(struct tcp_hdr);
+
+    // check data size
+    if (len < size) {
+      size = len;
+    }
+
+    // check send buffer size
+    wnd = TCP_SND_BUF_SIZE - (cb->snd.nxt - cb->snd.una);
+    if (wnd < size) {
+      size = wnd;
+      if (size <= 0) {
+        // wait until some data ack
+        fprintf(stderr, ">>> send : wait for ack %d %u %u<<<\n",
+                TCP_SND_BUF_SIZE, cb->snd.nxt, cb->snd.una);
+        pthread_cond_wait(&cb->cond, &mutex);
+        // retry
+        goto TCP_API_SEND_NEXT;
+      }
+    }
+
+    // send segment. if send window is not enough then stored into txq in tcp_tx
+    if (tcp_tx(cb, cb->snd.nxt, cb->rcv.nxt, TCP_FLG_PSH | TCP_FLG_ACK, &now,
+               buf + snt, size) == -1) {
+      // TODO: memory allocation error or ip_tx error
+      return snt;
+    }
+    cb->timeout = now.tv_sec + USER_TIMEOUT;
+    cb->snd.nxt += size;
+    snt += size;
+    len -= size;
+
+    if (len > 0) {
+      // send next segment
+      goto TCP_API_SEND_NEXT;
+    }
+  }
+
+  pthread_mutex_unlock(&mutex);
+  // TODO: support urg pointer
+  return snt;
 
 ERROR_SEND:
   pthread_mutex_unlock(&mutex);

@@ -26,6 +26,8 @@ static int setup(void) {
   return 0;
 }
 
+#define BUF_SIZE (100 * 1024)
+
 int main(int argc, char const *argv[]) {
   sigset_t sigset;
   int signo;
@@ -33,8 +35,10 @@ int main(int argc, char const *argv[]) {
   struct netif *netif;
   char *name = "tap2", *ipaddr = "192.168.33.13", *netmask = "255.255.0.0";
   int soc, listener;
-  uint8_t buf[1024];
+  uint8_t buf[BUF_SIZE];
   size_t n;
+
+  memset(buf, 'a', BUF_SIZE);
 
   // sigemptyset(&sigset);
   // sigaddset(&sigset, SIGINT);
@@ -85,14 +89,16 @@ int main(int argc, char const *argv[]) {
     }
     fprintf(stderr, "tcp_api_accept success: soc : %d\n", soc);
 
-    n = tcp_api_send(soc, "hello tcp world!\n", 17);
+    n = tcp_api_send(soc, buf, BUF_SIZE);
     if (n == -1) {
       fprintf(stderr, "tcp_api_send: failed\n");
-    } else {
+    } else if (n == BUF_SIZE) {
       fprintf(stderr, ">>> send data success <<<\n");
+    } else {
+      fprintf(stderr, "tcp_api_send: partial success : %d\n", n);
     }
 
-    n = tcp_api_recv(soc, buf, 1024);
+    n = tcp_api_recv(soc, buf, BUF_SIZE);
     if (n == -1) {
       fprintf(stderr, "tcp_api_recv: failed\n");
     } else if (n == 0) {
