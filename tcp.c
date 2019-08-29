@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 #include "ip.h"
@@ -10,7 +11,7 @@
 // TODO: user timeout should set by user
 #define USER_TIMEOUT (20)          /* user timeout (seconds) */
 #define TIME_WAIT_TIMEOUT (2 * 10) /* TIME_WAIT timeout (seconds) */
-#define TCP_SND_BUF_SIZE 4096
+#define TCP_SND_BUF_SIZE (10 * 1024)
 
 #define TCP_CB_TABLE_SIZE 128
 #define TCP_SOURCE_PORT_MIN 49152
@@ -73,7 +74,6 @@ struct tcp_txq_entry {
 struct tcp_txq_head {
   struct tcp_txq_entry *head;
   struct tcp_txq_entry *tail;
-  struct tcp_txq_entry *snt_tail;
   uint16_t snt;
 };
 
@@ -112,6 +112,7 @@ struct tcp_cb {
 static struct tcp_cb cb_table[TCP_CB_TABLE_SIZE];
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t timer_thread;
+static pthread_cond_t timer_cond;
 
 static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
                       uint8_t flg, struct timeval *now, uint8_t *buf,
@@ -369,6 +370,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
           // update snd.una and user timeout
           cb->snd.una = ntoh32(hdr->ack);
           cb->timeout = now.tv_sec + USER_TIMEOUT;
+          pthread_cond_signal(&timer_cond);
         }
 
         // TODO: clear all retransmission queue
@@ -531,6 +533,7 @@ static void tcp_event_segment_arrives(struct tcp_cb *cb, struct tcp_hdr *hdr,
             // update snd.una and user timeout
             cb->snd.una = ntoh32(hdr->ack);
             cb->timeout = now.tv_sec + USER_TIMEOUT;
+            pthread_cond_signal(&timer_cond);
           }
           // TODO: retransmission queue send
           pthread_cond_broadcast(&cb->cond);
@@ -711,6 +714,7 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
   ip_addr_t self, peer;
   uint32_t pseudo = 0;
   struct tcp_txq_entry *txq = NULL;
+  int have_unsent;
 
   // allocate segment
   segment = malloc(sizeof(struct tcp_hdr) + len);
@@ -745,22 +749,36 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
   pseudo += hton16(sizeof(struct tcp_hdr) + len);
   hdr->sum = cksum16((uint16_t *)hdr, sizeof(struct tcp_hdr) + len, pseudo);
 
-#ifdef TCP_DEBUG
-  fprintf(stderr, ">>> tcp_tx <<<\n");
-  tcp_dump(cb, hdr, len);
-#endif
-
   if (len > 0 || flg & (TCP_FLG_SYN | TCP_FLG_FIN)) {
     // add txq list only packets which have ack reply
+
+    // check unsent segment exists in cb->txq
+    have_unsent = cb->txq.tail && cb->txq.tail->timestamp.tv_sec == 0;
+
+    // add txq
     txq = tcp_txq_add(cb, hdr, sizeof(struct tcp_hdr) + len);
     if (!txq) {
       free(segment);
       return -1;
     }
 
-    // TODO: flow control
-    // TODO: check send window size and return
+    // flow control
+    // TODO: cb->txq.snt is not exactly the sliding window size
+    if (have_unsent || (!TCP_FLG_ISSET(hdr->flg, TCP_FLG_SYN) &&
+                        cb->txq.snt + len > cb->snd.wnd)) {
+      // before established snd.wnd is 0. so SYN does not care snd.wnd
+      // segment is stored in txq and send later in timer_thread
+      fprintf(stderr, ">>> not send havesent %d %d<<<\n", have_unsent,
+              cb->txq.tail);
+      tcp_dump(cb, hdr, len);
+      return 0;
+    }
   }
+
+#ifdef TCP_DEBUG
+  fprintf(stderr, ">>> tcp_tx <<<\n");
+  tcp_dump(cb, hdr, len);
+#endif
 
   // send packet
   if (ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)hdr,
@@ -875,14 +893,19 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
 }
 
 static void *tcp_timer_thread(void *arg) {
-  struct timeval timestamp;
+  struct timeval timestamp, diff;
+  struct timespec timeout;
   struct tcp_cb *cb;
   struct tcp_txq_entry *txq, *prev, *tmp;
+  size_t sum = 0;
   int i;
 
+  diff.tv_sec = 0;
+  diff.tv_usec = 100 * 1000;
+
+  pthread_mutex_lock(&mutex);
   while (1) {
     gettimeofday(&timestamp, NULL);
-    pthread_mutex_lock(&mutex);
     for (i = 0; i < TCP_CB_TABLE_SIZE; i++) {
       cb = &cb_table[i];
 
@@ -904,21 +927,51 @@ static void *tcp_timer_thread(void *arg) {
       // check retransmission timeout and vacuum acked segment entry
       prev = NULL;
       txq = cb->txq.head;
+      sum = 0;
       while (txq) {
         if (ntoh32(txq->segment->seq) >= cb->snd.una) {
-          if (timestamp.tv_sec - txq->timestamp.tv_sec > 3) {
-            // if retransmission timeout (3 seconds) then resend
+          // TODO: check sum + datalen should compare with snd.wnd. but
+          // txq->segment does not support splitting. so sum add later
+          /* sum += TCP_DATA_LEN(txq->segment, txq->len); */
+
+          if (sum < cb->snd.wnd) {
+            // this txq is in sliding send window
+
+            if (txq->timestamp.tv_sec == 0) {
+              // this txq is not sent
+
+              // TODO: re-calc checksum
 
 #ifdef TCP_DEBUG
-            fprintf(stderr, ">>> find retransmission timeout (%ld - %ld) <<<\n",
-                    timestamp.tv_sec, txq->timestamp.tv_sec);
-            tcp_dump(cb, txq->segment, TCP_DATA_LEN(txq->segment, txq->len));
+              fprintf(stderr, ">>> tcp_tx in timer_thread <<<\n");
+              tcp_dump(cb, txq->segment, TCP_DATA_LEN(txq->segment, txq->len));
 #endif
 
-            ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)txq->segment, txq->len,
-                  &cb->peer.addr);
-            txq->timestamp = timestamp;
+              // send packet
+              ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)txq->segment,
+                    txq->len, &cb->peer.addr);
+              txq->timestamp = timestamp;
+            } else if (timestamp.tv_sec - txq->timestamp.tv_sec > 3) {
+              // if retransmission timeout (3 seconds) then resend
+
+              // TODO: re-calc checksum
+
+#ifdef TCP_DEBUG
+              fprintf(stderr,
+                      ">>> find retransmission timeout (%ld - %ld) <<<\n",
+                      timestamp.tv_sec, txq->timestamp.tv_sec);
+              tcp_dump(cb, txq->segment, TCP_DATA_LEN(txq->segment, txq->len));
+#endif
+
+              // resend packet
+              ip_tx(cb->iface, IP_PROTOCOL_TCP, (uint8_t *)txq->segment,
+                    txq->len, &cb->peer.addr);
+              txq->timestamp = timestamp;
+            }
           }
+
+          // FIXME: temporary sum add here. no support splitting
+          sum += TCP_DATA_LEN(txq->segment, txq->len);
 
           // update previous tcp_txq_entry
           prev = txq;
@@ -948,10 +1001,13 @@ static void *tcp_timer_thread(void *arg) {
         }
       }
     }
-    pthread_mutex_unlock(&mutex);
     // sleep 100 ms
-    usleep(100 * 1000);
+    timeradd(&timestamp, &diff, &timestamp);
+    timeout.tv_sec = timestamp.tv_sec;
+    timeout.tv_nsec = timestamp.tv_usec * 1000;
+    pthread_cond_timedwait(&timer_cond, &mutex, &timeout);
   }
+  pthread_mutex_unlock(&mutex);
 
   return NULL;
 }
@@ -1412,6 +1468,7 @@ int tcp_init(void) {
     pthread_cond_init(&cb_table[i].cond, NULL);
   }
   pthread_mutex_init(&mutex, NULL);
+  pthread_cond_init(&timer_cond, NULL);
 
   if (ip_add_protocol(IP_PROTOCOL_TCP, tcp_rx) == -1) {
     return -1;
