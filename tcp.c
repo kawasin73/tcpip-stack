@@ -206,6 +206,19 @@ static void tcp_dump(struct tcp_cb *cb, struct tcp_hdr *hdr, size_t plen) {
   fprintf(stderr, " urg: %u\n", ntoh16(hdr->urg));
 }
 
+static uint16_t tcp_checksum(ip_addr_t self, ip_addr_t peer, uint8_t *segment,
+                             size_t len) {
+  uint32_t pseudo = 0;
+
+  pseudo += (self >> 16) & 0xffff;
+  pseudo += self & 0xffff;
+  pseudo += (peer >> 16) & 0xffff;
+  pseudo += self & 0xffff;
+  pseudo += hton16((uint16_t)IP_PROTOCOL_TCP);
+  pseudo += hton16(len);
+  return cksum16((uint16_t *)segment, len, pseudo);
+}
+
 /*
  * Segment Queue
  */
@@ -712,7 +725,6 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
   uint8_t *segment;
   struct tcp_hdr *hdr;
   ip_addr_t self, peer;
-  uint32_t pseudo = 0;
   struct tcp_txq_entry *txq = NULL;
   int have_unsent;
 
@@ -737,17 +749,6 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
 
   // copy data
   memcpy(hdr + 1, buf, len);
-
-  // calculate checksum
-  self = ((struct netif_ip *)cb->iface)->unicast;
-  peer = cb->peer.addr;
-  pseudo += (self >> 16) & 0xffff;
-  pseudo += self & 0xffff;
-  pseudo += (peer >> 16) & 0xffff;
-  pseudo += self & 0xffff;
-  pseudo += hton16((uint16_t)IP_PROTOCOL_TCP);
-  pseudo += hton16(sizeof(struct tcp_hdr) + len);
-  hdr->sum = cksum16((uint16_t *)hdr, sizeof(struct tcp_hdr) + len, pseudo);
 
   if (len > 0 || flg & (TCP_FLG_SYN | TCP_FLG_FIN)) {
     // add txq list only packets which have ack reply
@@ -774,6 +775,12 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
       return 0;
     }
   }
+
+  // calculate checksum
+  self = ((struct netif_ip *)cb->iface)->unicast;
+  peer = cb->peer.addr;
+  hdr->sum =
+      tcp_checksum(self, peer, (uint8_t *)hdr, sizeof(struct tcp_hdr) + len);
 
 #ifdef TCP_DEBUG
   fprintf(stderr, ">>> tcp_tx <<<\n");
@@ -806,7 +813,6 @@ static ssize_t tcp_tx(struct tcp_cb *cb, uint32_t seq, uint32_t ack,
 static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
                    struct netif *iface) {
   struct tcp_hdr *hdr;
-  uint32_t pseudo = 0;
   int i;
   struct tcp_cb *cb, *fcb = NULL, *lcb = NULL;
 
@@ -820,13 +826,7 @@ static void tcp_rx(uint8_t *segment, size_t len, ip_addr_t *src, ip_addr_t *dst,
 
   // validate checksum
   hdr = (struct tcp_hdr *)segment;
-  pseudo += *src >> 16;
-  pseudo += *src & 0xffff;
-  pseudo += *dst >> 16;
-  pseudo += *dst & 0xffff;
-  pseudo += hton16((uint16_t)IP_PROTOCOL_TCP);
-  pseudo += hton16(len);
-  if (cksum16((uint16_t *)hdr, len, pseudo) != 0) {
+  if (tcp_checksum(*src, *dst, segment, len) != 0) {
     fprintf(stderr, "tcp checksum error\n");
     return;
   }
@@ -897,6 +897,7 @@ static void *tcp_timer_thread(void *arg) {
   struct timespec timeout;
   struct tcp_cb *cb;
   struct tcp_txq_entry *txq, *prev, *tmp;
+  ip_addr_t self, peer;
   size_t sum = 0;
   int i;
 
@@ -908,6 +909,11 @@ static void *tcp_timer_thread(void *arg) {
     gettimeofday(&timestamp, NULL);
     for (i = 0; i < TCP_CB_TABLE_SIZE; i++) {
       cb = &cb_table[i];
+
+      if (cb->state == TCP_CB_STATE_CLOSED) {
+        // skip check timeout
+        continue;
+      }
 
       // check user timeout
       if ((cb->snd.una != cb->snd.nxt || cb->state == TCP_CB_STATE_TIME_WAIT) &&
@@ -928,6 +934,10 @@ static void *tcp_timer_thread(void *arg) {
       prev = NULL;
       txq = cb->txq.head;
       sum = 0;
+      if (cb->txq.head) {
+        self = ((struct netif_ip *)cb->iface)->unicast;
+        peer = cb->peer.addr;
+      }
       while (txq) {
         if (ntoh32(txq->segment->seq) >= cb->snd.una) {
           // TODO: check sum + datalen should compare with snd.wnd. but
@@ -940,7 +950,11 @@ static void *tcp_timer_thread(void *arg) {
             if (txq->timestamp.tv_sec == 0) {
               // this txq is not sent
 
-              // TODO: re-calc checksum
+              // re-calc checksum
+              txq->segment->ack = hton32(cb->rcv.nxt);
+              txq->segment->sum = 0;
+              txq->segment->sum =
+                  tcp_checksum(self, peer, txq->segment, txq->len);
 
 #ifdef TCP_DEBUG
               fprintf(stderr, ">>> tcp_tx in timer_thread <<<\n");
@@ -954,7 +968,11 @@ static void *tcp_timer_thread(void *arg) {
             } else if (timestamp.tv_sec - txq->timestamp.tv_sec > 3) {
               // if retransmission timeout (3 seconds) then resend
 
-              // TODO: re-calc checksum
+              // re-calc checksum
+              txq->segment->ack = hton32(cb->rcv.nxt);
+              txq->segment->sum = 0;
+              txq->segment->sum =
+                  tcp_checksum(self, peer, txq->segment, txq->len);
 
 #ifdef TCP_DEBUG
               fprintf(stderr,
@@ -1425,7 +1443,9 @@ TCP_API_SEND_NEXT:
       size = wnd;
       if (size <= 0) {
         // wait until some data ack
-        fprintf(stderr, ">>> send : wait for ack %d %u %u<<<\n",
+        fprintf(stderr,
+                ">>> send : wait for ack snd_buf_size: %d, snd.nxt: %u, "
+                "snd.una: %u <<<\n",
                 TCP_SND_BUF_SIZE, cb->snd.nxt, cb->snd.una);
         pthread_cond_wait(&cb->cond, &mutex);
         // retry
